@@ -129,8 +129,8 @@ export AZURE_SEARCH_ENDPOINT=https://<name>.search.windows.net
 export AZURE_SEARCH_API_KEY=<admin-key>
 
 python scripts/ingest.py --force        # creates the index, loads 127 chunks
-python -m rag.cli ask "What is the nightly hotel cap in London?"
-python -m rag.cli --department Sales ask "How many weeks of parental leave do I get?"
+python scripts/cli.py ask "What is the nightly hotel cap in London?"
+python scripts/cli.py --department Sales ask "How many weeks of parental leave do I get?"
 python eval/run_eval.py --profile improved --out eval/results/improved-azure.json
 ```
 

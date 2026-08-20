@@ -208,7 +208,13 @@ def _detect_boilerplate(page_lines: list[list[str]]) -> set[str]:
 
 
 def parse_pdf(path: Path) -> ParsedDoc:
-    import fitz  # PyMuPDF
+    # PyMuPDF renamed its module from `fitz` to `pymupdf`; 1.28.2 prints a
+    # deprecation warning on every `import fitz`, which lands in the middle of
+    # normal ingest output. Prefer the new name, fall back for older versions.
+    try:
+        import pymupdf as fitz
+    except ImportError:  # PyMuPDF < 1.24.3
+        import fitz
 
     doc = fitz.open(path)
     naive_text = "\n".join(page.get_text() for page in doc)

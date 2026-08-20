@@ -1,9 +1,13 @@
 """Command-line access to the assistant.
 
-    python -m rag.cli ask "What is the nightly hotel cap in London?"
-    python -m rag.cli ask "What is the limit?" --show-hits
-    python -m rag.cli chat --department Sales
-    python -m rag.cli compare "What does the Professional tier cost?"
+    python scripts/cli.py ask "What is the nightly hotel cap in London?"
+    python scripts/cli.py --show-hits ask "What is the limit?"
+    python scripts/cli.py chat --department Sales
+    python scripts/cli.py compare "What does the Professional tier cost?"
+
+After `pip install -e .` the same commands are available as `rag ask "..."`
+and `python -m rag.cli ask "..."`. Without an install, use scripts/cli.py:
+the package lives under src/, which `-m` does not put on sys.path.
 
 ``compare`` runs the same question through both profiles side by side, which is
 the quickest way to see a failure scenario and its fix.
@@ -138,7 +142,8 @@ def cmd_compare(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="rag.cli", description=__doc__)
+    # prog is derived from argv[0], so usage reflects however it was invoked
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--department", choices=[*DEPARTMENTS, "all"], default="all",
                         help="answer as a user of this department (security trimming)")
     parser.add_argument("--profile", choices=["improved", "baseline"], default=None)

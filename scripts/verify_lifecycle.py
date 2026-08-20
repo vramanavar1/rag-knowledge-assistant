@@ -40,7 +40,10 @@ def check(label: str, condition: bool, detail: str = "") -> None:
 
 def make_pricing_2027(path: Path) -> None:
     """A 2027 rate card that names the document it replaces."""
-    import fitz
+    try:
+        import pymupdf as fitz
+    except ImportError:  # PyMuPDF < 1.24.3
+        import fitz
 
     body = (
         "OrbitSuite Pricing — 2027 Rate Card\n"

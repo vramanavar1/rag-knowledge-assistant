@@ -71,19 +71,67 @@ Three pieces of state, and they behave differently:
 
 ## 2. Prerequisites
 
-**Required**
+### 2.1 Python
 
-- Python 3.13 (3.12 works). No other runtime.
-- Seven packages: `fastapi`, `uvicorn`, `pydantic`, `httpx`, `python-dotenv`,
-  `PyMuPDF`, `python-docx`. If your environment already has FastAPI, you likely
-  need nothing:
-  ```bash
-  pip install -r requirements.txt
-  ```
-  Azure OpenAI and Azure AI Search are called over their REST APIs with `httpx`
-  rather than through the SDKs, so there is no `azure-*` dependency at all.
+**Python 3.11 or newer.** Verified here on **3.13.7** and **3.14.6**. Nothing
+else is required — no Node, no database, no Azure account for §3 and §4.
 
-**Optional, for the Azure paths**
+```powershell
+python --version        # expect 3.11+
+```
+
+### 2.2 Create a virtual environment
+
+Not strictly required, but do it — it keeps these seven packages out of your
+system Python.
+
+```powershell
+# PowerShell (Windows)
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+```bash
+# bash / zsh (macOS, Linux, Git Bash)
+python -m venv .venv
+source .venv/bin/activate
+```
+
+> If PowerShell refuses to run the activation script, it is the execution
+> policy, not the repo:
+> `Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned`
+
+### 2.3 Install the dependencies
+
+```powershell
+pip install -r requirements.txt
+```
+
+Seven packages: `fastapi`, `uvicorn`, `pydantic`, `httpx`, `python-dotenv`,
+`PyMuPDF`, `python-docx`. There is no `azure-*` dependency — Azure OpenAI and
+Azure AI Search are called over their REST APIs with `httpx`. All seven ship
+prebuilt wheels, so no compiler is needed.
+
+### 2.4 Optional — install the package for a shorter CLI
+
+```powershell
+pip install -e .
+```
+
+This is **not required**. Everything works without it. It buys you `rag ask
+"..."` instead of `python scripts/cli.py ask "..."`, and makes `python -m
+rag.cli` work — the package lives under `src/`, which `python -m` does not put
+on `sys.path` on its own.
+
+### 2.5 Check the setup before going further
+
+```powershell
+python -c "import fastapi, uvicorn, pydantic, httpx, dotenv, pymupdf, docx; print('dependencies OK')"
+```
+
+If that prints `dependencies OK`, §3 and §4 will work with no further setup.
+
+### 2.6 Optional, for the Azure paths only (§5, §6)
 
 - An Azure subscription and the `az` CLI, logged in (`az login`).
 - Azure OpenAI with a chat deployment; ideally also an embedding deployment and
@@ -96,10 +144,9 @@ Three pieces of state, and they behave differently:
 ## 3. Path A — local, zero-install
 
 The fastest way to see it work. No Azure account, no credentials, no network.
+Complete §2 first, then two commands:
 
-```bash
-git clone <repo> && cd rag-knowledge-assistant
-
+```powershell
 # 1. Build the index from the corpus in KnwoledgeBaseDocuments/
 python scripts/ingest.py
 
@@ -107,11 +154,16 @@ python scripts/ingest.py
 uvicorn rag.api.app:app --app-dir src --port 8000
 ```
 
-Open <http://localhost:8000>.
+Open <http://localhost:8000>. Both commands are identical on PowerShell and
+bash, and neither needs an environment variable.
 
-**What step 1 does.** Walks the corpus, parses each document preserving table
-structure, chunks it section-aware with heading breadcrumbs, embeds each chunk,
-and writes `data/index.improved.json`. Expect:
+### What step 1 does
+
+Walks the corpus, parses each document preserving table structure, chunks it
+section-aware with heading breadcrumbs, embeds each chunk, and writes
+`data/index.improved.json` plus `data/manifest.improved.json`.
+
+**On the first run**, when `data/` does not yet exist:
 
 ```
 profile=improved  backend=local  embeddings=local-hashing
@@ -121,9 +173,65 @@ profile=improved  backend=local  embeddings=local-hashing
   superseded: Sales/Pricing2025.pdf
 ```
 
-`22 tables` is the signal that table-aware parsing worked. `superseded:
-Sales/Pricing2025.pdf` is version reconciliation noticing the 2026 rate card
-replaces the 2025 one.
+**On every run after that**, with the corpus unchanged:
+
+```
+profile=improved  backend=local  embeddings=local-hashing
+  0 new, 0 modified, 0 deleted, 11 unchanged
+  chunks: +0 written, -0 purged, 127 total (22 tables)
+  embeddings: 0 API batches, 0 cache hits
+```
+
+> **`0 new … 11 unchanged` is success, not a failure.** Ingestion is
+> incremental: each document is fingerprinted with a SHA-256 of its bytes, and
+> a document whose content has not changed is neither re-parsed nor re-embedded.
+> Re-running costs nothing. The line that tells you the index is fine is
+> `127 total (22 tables)` — not the `new` count.
+>
+> If `data/` already existed when you first ran it (for example it shipped with
+> your copy of the repo), your *first* run will show the second form. That is
+> expected.
+
+### Reading the output
+
+| Line | Meaning |
+|---|---|
+| `11 new … 0 unchanged` | How many documents were classified as new, modified, deleted or unchanged this run |
+| `+127 written, -0 purged` | Chunks added and removed **this run** |
+| `127 total (22 tables)` | The size of the index now. **This is the number that matters.** `22 tables` confirms table-aware parsing worked |
+| `0 API batches, 0 cache hits` | Embedding calls made. Zero here because no Azure embedding deployment is configured, so the local embedder ran |
+| `superseded: Sales/Pricing2025.pdf` | Version reconciliation noticed the 2026 rate card replaces the 2025 one |
+
+### Forcing a full rebuild
+
+To reproduce the first-run output, or after changing the embedding model:
+
+```powershell
+python scripts/ingest.py --force
+```
+
+Or delete the index and start clean:
+
+```powershell
+Remove-Item -Recurse -Force data     # PowerShell
+```
+```bash
+rm -rf data                          # bash
+```
+
+### Confirming it worked
+
+```powershell
+python scripts/ingest.py --list
+```
+
+Expect 11 rows — department, type, effective date, version, current flag and
+chunk count per document, with `Sales/Pricing2025.pdf` showing `NO` under
+`cur` because the 2026 card superseded it.
+
+Once the API is running, `curl http://localhost:8000/health` should return
+`200` and report `"documents": 11, "chunks": 127`. A **503** there means the
+index is empty — run step 1.
 
 **What you get with no credentials.** The app runs completely, and says exactly
 what it is running on:
@@ -144,14 +252,24 @@ question comes back as a written, cited, verified answer.
 
 ### From the terminal instead
 
-```bash
-python -m rag.cli ask "What is the nightly hotel cap in London?"
-python -m rag.cli chat --department Sales          # multi-turn, department-scoped
-python -m rag.cli compare "What was the Professional tier price in 2025?"
+```powershell
+python scripts/cli.py ask "What is the nightly hotel cap in London?"
+python scripts/cli.py chat --department Sales          # multi-turn, department-scoped
+python scripts/cli.py compare "What was the Professional tier price in 2025?"
 ```
 
 `compare` runs the question through both the naive baseline and the improved
 pipeline side by side — the quickest way to see a failure scenario and its fix.
+
+> **Why `scripts/cli.py` and not `python -m rag.cli`?** The package lives under
+> `src/`, and `python -m` puts the *current directory* on `sys.path`, never
+> `src/` — so `python -m rag.cli` fails with `ModuleNotFoundError: No module
+> named 'rag'` from a clean checkout. `scripts/cli.py` puts `src` on the path
+> and hands over, exactly as `scripts/ingest.py` does. No environment variable,
+> same command on every shell.
+>
+> If you ran `pip install -e .` (§2.4), then `rag ask "..."` and
+> `python -m rag.cli ask "..."` both work as well.
 
 ---
 
@@ -263,8 +381,28 @@ scoring 34/35 is expected; 33/35 or lower is a regression.
 
 ### 5.1 Azure OpenAI
 
+Easiest and shell-independent — copy `.env.example` to `.env` and edit it;
+`python-dotenv` loads it automatically on every platform:
+
+```powershell
+Copy-Item .env.example .env     # PowerShell
+```
 ```bash
-cp .env.example .env      # then edit, or export directly
+cp .env.example .env            # bash
+```
+
+Or set them in the shell directly:
+
+```powershell
+# PowerShell
+$env:AZURE_OPENAI_ENDPOINT             = "https://<resource>.openai.azure.com"
+$env:AZURE_OPENAI_API_KEY              = "<key>"
+$env:AZURE_OPENAI_CHAT_DEPLOYMENT      = "gpt-4o"
+$env:AZURE_OPENAI_UTILITY_DEPLOYMENT   = "gpt-4o-mini"
+$env:AZURE_OPENAI_EMBEDDING_DEPLOYMENT = "text-embedding-3-small"
+```
+```bash
+# bash / zsh
 export AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com
 export AZURE_OPENAI_API_KEY=<key>
 export AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-4o
@@ -289,23 +427,38 @@ Three things worth knowing:
 Verify what is live:
 
 ```bash
-python -m rag.cli ask "What is the minimum password length?"
+python scripts/cli.py ask "What is the minimum password length?"
 # startup log should read: chat provider active  provider=azure-openai:<deployment>
 ```
 
 ### 5.2 Azure AI Search
 
 ```bash
-# creates the search service, and model deployments if OPENAI_NAME is set
+# creates the search service, and model deployments if OPENAI_NAME is set.
+# This one is a bash script — on Windows run it from Git Bash or WSL.
 RESOURCE_GROUP=rg-rag SEARCH_SKU=basic OPENAI_NAME=<aoai-resource> \
   bash scripts/provision_azure_search.sh
+```
 
+Then point the app at it:
+
+```powershell
+# PowerShell
+$env:RETRIEVER_BACKEND     = "azure"
+$env:AZURE_SEARCH_ENDPOINT = "https://<name>.search.windows.net"
+$env:AZURE_SEARCH_API_KEY  = "<admin-key>"
+$env:AZURE_SEARCH_INDEX    = "northwind-kb"
+
+python scripts/ingest.py --force        # creates the index and loads it
+```
+```bash
+# bash / zsh
 export RETRIEVER_BACKEND=azure
 export AZURE_SEARCH_ENDPOINT=https://<name>.search.windows.net
 export AZURE_SEARCH_API_KEY=<admin-key>
 export AZURE_SEARCH_INDEX=northwind-kb
 
-python scripts/ingest.py --force        # creates the index and loads it
+python scripts/ingest.py --force
 ```
 
 The index is created by `ingest.py` with a `PUT`, which is create-or-update, so
@@ -322,9 +475,9 @@ service. Run this checklist the first time you point it at real Azure:
 
 ```bash
 python scripts/ingest.py --force        # expect: index created, 127 chunks
-python -m rag.cli ask "What is the nightly hotel cap in London?"
+python scripts/cli.py ask "What is the nightly hotel cap in London?"
 #   expect: $350, and rerank_method=azure-semantic in the trace
-python -m rag.cli --department Sales ask "How many weeks of parental leave do I get?"
+python scripts/cli.py --department Sales ask "How many weeks of parental leave do I get?"
 #   expect: declined
 python eval/run_eval.py --profile improved --out eval/results/improved-azure.json
 #   expect: at or above the local backend's scores
@@ -336,7 +489,14 @@ If every Azure call fails with `CERTIFICATE_VERIFY_FAILED: unable to get local
 issuer certificate`, your network is intercepting TLS with a CA that Python's
 bundled certificate store does not know. Three options, best first:
 
+```powershell
+# PowerShell
+$env:AZURE_CA_BUNDLE        = "C:\path\to\corporate-root.pem"   # correct fix
+$env:AZURE_USE_SYSTEM_CERTS = "true"    # use the Windows trust store
+$env:AZURE_TLS_VERIFY       = "false"   # dev only; warns on every start
+```
 ```bash
+# bash / zsh
 export AZURE_CA_BUNDLE=/path/to/corporate-root.pem   # correct fix
 export AZURE_USE_SYSTEM_CERTS=true                   # use the OS trust store
 export AZURE_TLS_VERIFY=false                        # dev only; warns on every start
@@ -654,6 +814,10 @@ per-department quotas at the gateway.
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `ModuleNotFoundError: No module named 'rag'` | You ran `python -m rag.cli`; the package is under `src/`, which `-m` does not put on `sys.path` | Use `python scripts/cli.py …`, or `pip install -e .` first — §2.4 |
+| `ingest.py` prints `0 new … 11 unchanged` | Nothing is wrong — ingestion is incremental and the corpus has not changed | Check `127 total (22 tables)`. `--force` rebuilds — §3 |
+| `warning: The fitz API is deprecated` | PyMuPDF ≥ 1.28.2 with the old import name | Fixed in this repo; `git pull` if you still see it |
+| PowerShell: `Activate.ps1 cannot be loaded` | Script execution policy | `Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned` — §2.2 |
 | `CERTIFICATE_VERIFY_FAILED` on every Azure call | TLS-inspecting proxy with a CA Python does not trust | §5.3 |
 | `/health` returns 503, UI says "index is empty" | No index built, or `RAG_DATA_DIR` points elsewhere | `python scripts/ingest.py` |
 | `DeploymentNotFound` | Deployment name ≠ model name; they are independent | `az cognitiveservices account deployment list` |

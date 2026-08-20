@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-knowledge-assistant"
+version = "1.0.0"
+description = "RAG knowledge assistant over an enterprise document set, on the Azure AI stack"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# Mirrors requirements.txt. Azure OpenAI and Azure AI Search are called over
+# their REST APIs with httpx rather than through the azure-* SDKs, which is why
+# none appear here -- see README.md, "Why REST instead of the SDKs".
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.9",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "PyMuPDF>=1.24",
+    "python-docx>=1.1",
+]
+
+[project.optional-dependencies]
+# numpy is used through a try/except fast path: it accelerates vector scoring
+# by roughly 20x and is never required.
+fast = ["numpy>=1.26"]
+
+[project.scripts]
+rag = "rag.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Installing is optional. `python scripts/ingest.py`, `python scripts/cli.py`
+# and `uvicorn rag.api.app:app --app-dir src` all work without it. Installing
+# with `pip install -e .` additionally enables `rag ask "..."` and
+# `python -m rag.cli ask "..."`.

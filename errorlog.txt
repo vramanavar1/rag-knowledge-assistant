@@ -1,0 +1,13 @@
+PS C:\VSquareThoughts\rag-knowledge-assistant> python scripts/cli.py ask "What is the nightly hotel cap in London?"
+
+[ANSWER]  confidence=1.00
+  query -> What is the nightly hotel cap in London?
+
+The nightly hotel cap in London is $350, excluding taxes and fees [1][2].
+
+Sources:
+  [1] Business Travel Policy > 4. Hotel Accommodations  (Finance/TravelPolicy.docx)
+  [2] Business Travel Policy > 4. Hotel Accommodations  (Finance/TravelPolicy.docx)
+
+  condense=0.0ms decompose=0.0ms embed=0.6ms search=29.6ms version_filter=0.1ms rerank=2663.1ms version_rank=0.1ms context=0.0ms generate=1564.5ms verify=1917.4ms
+  total=6175.7ms  tokens=2588+277  llm_calls=3  cache=miss

@@ -39,10 +39,18 @@ python scripts/verify_pipeline.py     # 9/9 stages, 53 checks
 
 ## Quick start
 
-The repo runs with **no installs** — it uses only `fastapi`, `uvicorn`,
-`pydantic`, `httpx`, `python-dotenv`, `PyMuPDF` and `python-docx`, and every
-Azure call goes over REST (see [why](#why-rest-instead-of-the-sdks)). If any are
-missing: `pip install -r requirements.txt`.
+Python 3.11+ and seven packages — `fastapi`, `uvicorn`, `pydantic`, `httpx`,
+`python-dotenv`, `PyMuPDF`, `python-docx`. No `azure-*` dependency: every Azure
+call goes over REST (see [why](#why-rest-instead-of-the-sdks)).
+
+```bash
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1     # PowerShell   (bash: source .venv/bin/activate)
+pip install -r requirements.txt
+```
+
+Full setup, including the Azure paths and production deployment, is in
+**[Deployment.md](Deployment.md)**.
 
 ```bash
 # 1. Build the index (no Azure needed — falls back to a local embedder)
@@ -53,9 +61,9 @@ uvicorn rag.api.app:app --app-dir src --port 8000
 #    → http://localhost:8000
 
 # or from the terminal
-python -m rag.cli ask "What is the nightly hotel cap in London?"
-python -m rag.cli chat --department Sales
-python -m rag.cli compare "What was the Professional tier price in 2025?"
+python scripts/cli.py ask "What is the nightly hotel cap in London?"
+python scripts/cli.py chat --department Sales
+python scripts/cli.py compare "What was the Professional tier price in 2025?"
 
 # or in a container (337 MB, index baked in, non-root)
 docker build -t rag-assistant . && docker run --rm -p 8000:8000 rag-assistant
@@ -181,7 +189,8 @@ src/rag/
   text.py  models.py  config.py  service.py  cli.py
 eval/       dataset.jsonl  metrics.py  run_eval.py  results/
 Dockerfile  .dockerignore  Deployment.md
-scripts/    ingest.py  verify_pipeline.py  verify_lifecycle.py
+pyproject.toml
+scripts/    cli.py  ingest.py  verify_pipeline.py  verify_lifecycle.py
             _azure_search_stub.py  provision_azure_search.sh  render_pdf.py
 docs/       pipeline.md  architecture.md  ingestion-flow.md
             failure-scenarios.md  evaluation.md

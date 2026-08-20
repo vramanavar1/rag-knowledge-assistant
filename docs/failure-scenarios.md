@@ -6,7 +6,7 @@ inspecting the pipeline rather than guessing, the fix, and the evidence.
 Reproduce any of these side by side:
 
 ```bash
-python -m rag.cli compare "What was the Professional tier price in 2025?"
+python scripts/cli.py compare "What was the Professional tier price in 2025?"
 ```
 
 ---

@@ -9,6 +9,9 @@
 
 # --- python ---
 __pycache__/
+*.egg-info/
+build/
+dist/
 *.py[cod]
 .venv/
 venv/
