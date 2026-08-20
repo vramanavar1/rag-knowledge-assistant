@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Northwind Knowledge Assistant</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%93%9A%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f7f7f8; --panel: #ffffff; --ink: #1a1a1c; --muted: #6b6b73;
+    --line: #e2e2e6; --accent: #2f5bd0; --accent-soft: #eaf0ff;
+    --ok: #1f7a4d; --warn: #a16207; --stop: #b3261e; --code: #f2f2f5;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17171a; --panel: #202024; --ink: #e9e9ec; --muted: #9a9aa4;
+      --line: #32323a; --accent: #7ea2ff; --accent-soft: #23293a;
+      --ok: #5cc48d; --warn: #e0b44c; --stop: #ef8279; --code: #26262c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    padding: 14px 20px; display: flex; gap: 16px; align-items: center;
+    flex-wrap: wrap; position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+  .spacer { flex: 1; }
+  .pill {
+    font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+  }
+  .pill.live { color: var(--ok); border-color: currentColor; }
+  .pill.degraded { color: var(--warn); border-color: currentColor; }
+  select, button, input, textarea { font: inherit; color: inherit; }
+  select {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 10px;
+  }
+  main { max-width: 940px; margin: 0 auto; padding: 22px 20px 140px; }
+
+  .examples { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px; }
+  .examples button {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+    padding: 6px 12px; font-size: 13px; cursor: pointer; text-align: left;
+  }
+  .examples button:hover { border-color: var(--accent); color: var(--accent); }
+  .examples .tag {
+    color: var(--muted); font-size: 11px; text-transform: uppercase;
+    letter-spacing: .04em; margin-right: 6px;
+  }
+
+  .turn { margin-bottom: 22px; }
+  .q {
+    background: var(--accent-soft); border-radius: var(--radius);
+    padding: 11px 14px; margin-bottom: 10px; font-weight: 550;
+  }
+  .a {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 14px 16px;
+  }
+  .a .body { white-space: pre-wrap; }
+  .a .body table { border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+  .meta {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    margin-bottom: 10px; font-size: 12px; color: var(--muted);
+  }
+  .badge {
+    font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+    padding: 2px 8px; border-radius: 5px; border: 1px solid currentColor;
+  }
+  .badge.answered { color: var(--ok); }
+  .badge.insufficient_evidence { color: var(--warn); }
+  .badge.needs_clarification { color: var(--accent); }
+  .badge.denied { color: var(--stop); }
+  .conf { display: flex; align-items: center; gap: 6px; }
+  .bar { width: 74px; height: 5px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--ok); }
+
+  .cites { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+  .cites li { font-size: 13px; margin-bottom: 5px; list-style: none; }
+  .cites ol { margin: 0; padding: 0; }
+  .cites .marker { color: var(--accent); font-weight: 650; margin-right: 5px; }
+  .cites .where { color: var(--muted); }
+
+  details { margin-top: 10px; }
+  summary {
+    cursor: pointer; font-size: 12.5px; color: var(--muted);
+    padding: 4px 0; user-select: none;
+  }
+  summary:hover { color: var(--accent); }
+  .hit {
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 9px 11px; margin: 8px 0; font-size: 13px;
+  }
+  .hit .top { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
+  .hit .name { font-weight: 600; }
+  .hit .scores { color: var(--muted); font-size: 11.5px; font-family: ui-monospace, monospace; }
+  .hit pre {
+    margin: 7px 0 0; padding: 8px; background: var(--code); border-radius: 6px;
+    overflow-x: auto; font-size: 12px; white-space: pre-wrap; max-height: 190px;
+  }
+  .chip {
+    font-size: 10.5px; padding: 1px 6px; border-radius: 4px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .chip.table { color: var(--accent); border-color: currentColor; }
+  .chip.superseded { color: var(--stop); border-color: currentColor; }
+  pre.trace {
+    background: var(--code); padding: 10px; border-radius: 8px;
+    overflow-x: auto; font-size: 11.5px; max-height: 320px;
+  }
+
+  form.ask {
+    position: fixed; bottom: 0; left: 0; right: 0; background: var(--panel);
+    border-top: 1px solid var(--line); padding: 12px 20px;
+  }
+  form.ask .inner { max-width: 940px; margin: 0 auto; display: flex; gap: 10px; }
+  textarea {
+    flex: 1; resize: none; border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; background: var(--bg); min-height: 44px; max-height: 140px;
+  }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button.send {
+    background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+    padding: 0 20px; font-weight: 600; cursor: pointer;
+  }
+  button.send:disabled { opacity: .5; cursor: default; }
+  button.ghost {
+    background: transparent; border: 1px solid var(--line); border-radius: 8px;
+    padding: 0 14px; cursor: pointer; color: var(--muted);
+  }
+  .thinking { color: var(--muted); font-style: italic; }
+  code { background: var(--code); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Northwind Knowledge Assistant</h1>
+  <span class="pill" id="health">checking…</span>
+  <span class="spacer"></span>
+  <label style="font-size:13px;color:var(--muted)">View as
+    <select id="who"></select>
+  </label>
+  <button class="ghost" id="reset" style="height:32px">New chat</button>
+</header>
+
+<main>
+  <div class="examples" id="examples"></div>
+  <div id="thread"></div>
+</main>
+
+<form class="ask" id="form">
+  <div class="inner">
+    <textarea id="q" placeholder="Ask about leave, expenses, travel, pricing, VPN, contracts…" rows="1"></textarea>
+    <button class="send" id="send" type="submit">Ask</button>
+  </div>
+</form>
+
+<script>
+const EXAMPLES = [
+  ["table lookup",   "What is the nightly hotel cap in London?"],
+  ["versioning",     "What does the Professional tier cost per seat?"],
+  ["history",        "What was the Professional tier price in 2025?"],
+  ["multi-hop",      "For a 150 seat annual prepaid contract, what discount applies and who approves it?"],
+  ["ambiguous",      "What is the limit?"],
+  ["no answer",      "What is the company's severance policy?"],
+  ["follow-up",      "What is the Enterprise plan cancellation policy?"],
+];
+
+const thread = document.getElementById('thread');
+const form = document.getElementById('form');
+const input = document.getElementById('q');
+const send = document.getElementById('send');
+const who = document.getElementById('who');
+let history = [];
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+
+async function boot() {
+  try {
+    const r = await fetch('/health');
+    const h = await r.json();
+    const pill = document.getElementById('health');
+    pill.textContent = `${h.index.documents} docs · ${h.index.chunks} chunks · ${h.profile} · ${h.providers.llm_available ? 'LLM live' : 'no LLM'}`;
+    pill.className = 'pill ' + (h.status === 'ready' ? 'live' : 'degraded');
+  } catch { document.getElementById('health').textContent = 'API unreachable'; }
+
+  try {
+    const r = await fetch('/api/v1/principals');
+    const p = await r.json();
+    for (const [token, info] of Object.entries(p.tokens)) {
+      const o = el('option', null, `${info.display_name} — ${info.departments.join(', ')}`);
+      o.value = token;
+      who.appendChild(o);
+    }
+  } catch {}
+
+  const box = document.getElementById('examples');
+  for (const [tag, q] of EXAMPLES) {
+    const b = el('button');
+    b.appendChild(el('span', 'tag', tag));
+    b.appendChild(document.createTextNode(q));
+    b.onclick = () => { input.value = q; form.requestSubmit(); };
+    box.appendChild(b);
+  }
+}
+
+function renderCitations(list) {
+  if (!list.length) return null;
+  const wrap = el('div', 'cites');
+  const ol = el('ol');
+  for (const c of list) {
+    const li = el('li');
+    li.appendChild(el('span', 'marker', c.marker));
+    li.appendChild(document.createTextNode(c.title + ' '));
+    li.appendChild(el('span', 'where', '› ' + c.section_path + (c.page ? ' · p' + c.page : '') + ' · ' + c.source_path));
+    ol.appendChild(li);
+  }
+  wrap.appendChild(ol);
+  return wrap;
+}
+
+function renderHits(hits) {
+  if (!hits.length) return null;
+  const d = el('details');
+  d.appendChild(el('summary', null, `Why these ${hits.length} passages? (retrieval trace)`));
+  hits.forEach((h, i) => {
+    const box = el('div', 'hit');
+    const top = el('div', 'top');
+    top.appendChild(el('span', 'name', `${i + 1}. ${h.title} › ${h.section_path}`));
+    top.appendChild(el('span', 'chip', h.department));
+    if (h.content_type === 'table') top.appendChild(el('span', 'chip table', 'table'));
+    if (!h.is_current) top.appendChild(el('span', 'chip superseded', 'superseded'));
+    box.appendChild(top);
+
+    const parts = [`score ${h.score.toFixed(2)}`];
+    if (h.rerank_score !== null) parts.push(`rerank ${h.rerank_score.toFixed(1)}/10`);
+    if (h.rrf_score !== null) parts.push(`rrf ${h.rrf_score.toFixed(4)}`);
+    if (h.keyword_score !== null) parts.push(`bm25 ${h.keyword_score.toFixed(2)}`);
+    if (h.vector_score !== null) parts.push(`vec ${h.vector_score.toFixed(3)}`);
+    if (h.recency_boost) parts.push(`version ${h.recency_boost > 0 ? '+' : ''}${h.recency_boost}`);
+    if (h.matched_subquery) parts.push(`via "${h.matched_subquery}"`);
+    box.appendChild(el('div', 'scores', parts.join('  ·  ')));
+
+    const pre = el('pre', null, h.text);
+    box.appendChild(pre);
+    d.appendChild(box);
+  });
+  return d;
+}
+
+function renderTrace(trace) {
+  if (!trace) return null;
+  const d = el('details');
+  const stages = (trace.stages || []).map(s => `${s.name} ${s.ms}ms`).join(' · ');
+  const tok = trace.tokens || {};
+  d.appendChild(el('summary', null,
+    `Pipeline: ${stages || 'n/a'} — ${trace.total_ms || '?'}ms total, ` +
+    `${(tok.prompt || 0) + (tok.completion || 0)} tokens, ${trace.llm_calls || 0} model calls`));
+  d.appendChild(el('pre', 'trace', JSON.stringify(trace, null, 2)));
+  return d;
+}
+
+function renderAnswer(container, data) {
+  container.textContent = '';
+  const meta = el('div', 'meta');
+  meta.appendChild(el('span', 'badge ' + data.status, data.status.replace(/_/g, ' ')));
+
+  const conf = el('div', 'conf');
+  conf.appendChild(el('span', null, 'confidence'));
+  const bar = el('div', 'bar');
+  const fill = el('i');
+  fill.style.width = Math.round(data.confidence * 100) + '%';
+  if (data.confidence < 0.5) fill.style.background = 'var(--warn)';
+  bar.appendChild(fill);
+  conf.appendChild(bar);
+  conf.appendChild(el('span', null, data.confidence.toFixed(2)));
+  meta.appendChild(conf);
+
+  if (data.standalone_query) meta.appendChild(el('span', null, '↻ ' + data.standalone_query));
+  container.appendChild(meta);
+
+  container.appendChild(el('div', 'body', data.answer));
+
+  if (data.subqueries && data.subqueries.length > 1) {
+    const d = el('details');
+    d.appendChild(el('summary', null, `Split into ${data.subqueries.length} sub-queries`));
+    const ul = el('ul');
+    data.subqueries.forEach(s => ul.appendChild(el('li', null, s)));
+    d.appendChild(ul);
+    container.appendChild(d);
+  }
+
+  const c = renderCitations(data.citations); if (c) container.appendChild(c);
+  const h = renderHits(data.hits || []); if (h) container.appendChild(h);
+  const t = renderTrace(data.trace); if (t) container.appendChild(t);
+}
+
+form.onsubmit = async (e) => {
+  e.preventDefault();
+  const question = input.value.trim();
+  if (!question) return;
+  input.value = '';
+  send.disabled = true;
+
+  const turn = el('div', 'turn');
+  turn.appendChild(el('div', 'q', question));
+  const answerBox = el('div', 'a');
+  answerBox.appendChild(el('div', 'thinking', 'Retrieving and checking sources…'));
+  turn.appendChild(answerBox);
+  thread.appendChild(turn);
+  window.scrollTo(0, document.body.scrollHeight);
+
+  try {
+    const r = await fetch('/api/v1/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + who.value },
+      body: JSON.stringify({ question, history })
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || data.error || r.statusText);
+    renderAnswer(answerBox, data);
+    history.push({ role: 'user', content: question });
+    history.push({ role: 'assistant', content: data.answer });
+    if (history.length > 12) history = history.slice(-12);
+  } catch (err) {
+    answerBox.textContent = '';
+    answerBox.appendChild(el('div', 'badge denied', 'error'));
+    answerBox.appendChild(el('div', 'body', String(err)));
+  } finally {
+    send.disabled = false;
+    input.focus();
+    window.scrollTo(0, document.body.scrollHeight);
+  }
+};
+
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+});
+document.getElementById('reset').onclick = () => { history = []; thread.textContent = ''; input.focus(); };
+
+boot();
+</script>
+</body>
+</html>

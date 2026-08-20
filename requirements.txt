@@ -1,0 +1,20 @@
+# Runtime dependencies.
+#
+# NOTE: the application deliberately talks to Azure OpenAI and Azure AI Search
+# over their REST APIs using httpx, rather than through the azure-* / openai
+# SDKs.  That keeps the dependency surface to packages that are almost always
+# already present, so the repo runs with `uvicorn` straight after clone.
+# See README.md -> "Why REST instead of the SDKs".
+
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.9
+httpx>=0.27
+python-dotenv>=1.0
+PyMuPDF>=1.24          # PDF parsing incl. table structure recovery (find_tables)
+python-docx>=1.1       # DOCX parsing incl. inline table ordering
+
+# --- optional, auto-detected at runtime ---
+# numpy>=1.26          # ~20x faster vector scoring; pure-python fallback used if absent
+# azure-search-documents>=11.5   # only if you prefer the SDK over the REST adapter
+# azure-identity>=1.17            # only if you switch from API keys to Managed Identity

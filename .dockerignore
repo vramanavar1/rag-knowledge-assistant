@@ -1,0 +1,44 @@
+# Patterns are relative to the build context root. Docker uses Go's
+# filepath.Match, where `*` does NOT cross `/` — so `*.docx` matches only the
+# assignment brief at the root, not the corpus. That distinction is too subtle
+# to rely on for a file that decides whether the knowledge base makes it into
+# the image, so the corpus is re-included explicitly at the bottom.
+
+# --- version control / tooling state ---
+.git
+.gitignore
+.claude/
+.playwright-mcp/
+
+# --- python ---
+**/__pycache__
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- secrets: never in a build context ---
+.env
+.env.local
+*.key
+
+# --- build artefacts ---
+# A stale index built with someone else's embedding provider. The image bakes
+# its own in the `index` stage.
+data/
+eval/results/*.json
+
+# --- docs and generated files, not needed at runtime ---
+docs/
+*.md
+/docs/*.pdf
+*.png
+
+# --- the assignment brief at the repo root (not the corpus) ---
+*.docx
+
+# --- always keep the knowledge base, whatever the rules above say ---
+# Later rules win, so this guarantees the corpus reaches the image regardless of
+# how the extension patterns are interpreted.
+!KnwoledgeBaseDocuments/**

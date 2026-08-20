@@ -1,0 +1,34 @@
+# NOTE: .gitignore does not support trailing inline comments -- a pattern like
+# `data/   # generated` is read as a literal path with spaces and matches
+# nothing. Comments must be on their own line.
+
+# --- secrets ---
+.env
+.env.local
+*.key
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- build artefacts ---
+# generated index, ingestion manifest and embedding cache
+data/
+# raw evaluation runs; eval/results/comparison.md IS committed
+eval/results/*.json
+.DS_Store
+
+# --- source assignment brief (not part of the deliverable) ---
+*.docx
+!KnwoledgeBaseDocuments/**/*.docx
+
+# --- tooling artefacts ---
+.playwright-mcp/
+*.png
+
+# --- local agent/editor state ---
+.claude/
