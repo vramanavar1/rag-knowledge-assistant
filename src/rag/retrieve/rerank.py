@@ -99,7 +99,7 @@ def lexical_rerank(query: str, hits: list[Hit]) -> list[Hit]:
     return hits
 
 
-def llm_rerank(query: str, hits: list[Hit], llm: ChatProvider) -> list[Hit] | None:
+async def llm_rerank(query: str, hits: list[Hit], llm: ChatProvider) -> list[Hit] | None:
     """Score candidates with a model. Returns ``None`` if the call fails."""
     if not hits:
         return hits
@@ -112,7 +112,7 @@ def llm_rerank(query: str, hits: list[Hit], llm: ChatProvider) -> list[Hit] | No
             f"[{index}] {chunk.title} > {chunk.section_path}\n{snippet}"
         )
 
-    result = llm.complete(
+    result = await llm.complete(
         [
             {"role": "system", "content": _RERANK_SYSTEM},
             {
@@ -149,7 +149,7 @@ def _is_degenerate(hits: list[Hit]) -> bool:
     return bool(hits) and all((h.rerank_score or 0.0) <= 0.0 for h in hits)
 
 
-def rerank(query: str, hits: list[Hit], llm: ChatProvider) -> tuple[list[Hit], str]:
+async def rerank(query: str, hits: list[Hit], llm: ChatProvider) -> tuple[list[Hit], str]:
     """Rerank candidates, returning ``(hits, method_used)``."""
     candidates = hits[:MAX_CANDIDATES]
 
@@ -162,7 +162,7 @@ def rerank(query: str, hits: list[Hit], llm: ChatProvider) -> tuple[list[Hit], s
 
     method = "lexical"
     if llm.available:
-        reranked = llm_rerank(query, candidates, llm)
+        reranked = await llm_rerank(query, candidates, llm)
         if reranked is None:
             lexical_rerank(query, candidates)
             log.warning("LLM rerank failed, used lexical fallback")

@@ -16,6 +16,7 @@ against.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -80,19 +81,19 @@ class Retriever:
 
     # ------------------------------------------------------------------
 
-    def retrieve(
+    async def retrieve(
         self,
         query: str,
         history: list[Turn] | None = None,
         principal: Principal | None = None,
     ) -> RetrievalOutcome:
         if self._settings.is_baseline:
-            return self._retrieve_baseline(query, principal)
-        return self._retrieve_improved(query, history or [], principal)
+            return await self._retrieve_baseline(query, principal)
+        return await self._retrieve_improved(query, history or [], principal)
 
     # ------------------------------------------------------------------
 
-    def _retrieve_baseline(
+    async def _retrieve_baseline(
         self, query: str, principal: Principal | None
     ) -> RetrievalOutcome:
         """Single-shot top-k vector search. No rewriting, ranking or filtering.
@@ -102,13 +103,13 @@ class Retriever:
         evaluation reports it as a finding rather than hiding it.
         """
         with stage("embed") as st:
-            vector = self._embedder.embed([query])[0]
+            vector = (await self._embedder.embed([query]))[0]
             st["vectors"] = 1
             st["dimensions"] = self._embedder.dimensions
             st["provider"] = self._embedder.name
 
         with stage("search") as st:
-            hits = self._backend.search(
+            hits = await self._backend.search(
                 query,
                 vector,
                 SearchFilters(),
@@ -129,7 +130,7 @@ class Retriever:
 
     # ------------------------------------------------------------------
 
-    def _retrieve_improved(
+    async def _retrieve_improved(
         self,
         query: str,
         history: list[Turn],
@@ -138,11 +139,11 @@ class Retriever:
         trace: dict[str, Any] = {"profile": "improved", "mode": MODE_HYBRID}
 
         with stage("condense") as st:
-            standalone, condensed = condense_query(query, history, self._llm)
+            standalone, condensed = await condense_query(query, history, self._llm)
             st["rewritten"] = condensed
 
         with stage("decompose") as st:
-            subqueries = decompose_query(standalone, self._llm)
+            subqueries = await decompose_query(standalone, self._llm)
             st["subqueries"] = len(subqueries)
 
         filters = self._filters_for(principal)
@@ -154,22 +155,36 @@ class Retriever:
         # different reasons, and a latency regression in one says nothing about
         # the other.
         with stage("embed") as st:
-            vectors = self._embedder.embed(subqueries)
+            vectors = await self._embedder.embed(subqueries)
             st["vectors"] = len(vectors)
             st["dimensions"] = self._embedder.dimensions
             st["provider"] = self._embedder.name
 
         with stage("search") as st:
-            merged: dict[str, Hit] = {}
-
-            for subquery, vector in zip(subqueries, vectors):
-                found = self._backend.search(
+            # Sub-queries are independent lookups, so they go out concurrently.
+            # Run serially, a decomposed question pays up to three round trips
+            # end to end -- against a remote index that is the dominant cost of
+            # the stage, and it is pure waiting.
+            #
+            # No `stage()` inside the fan-out: concurrent tasks appending to the
+            # trace would produce overlapping, unreadable timings.
+            pairs = list(zip(subqueries, vectors))
+            results = await asyncio.gather(*(
+                self._backend.search(
                     subquery,
                     vector,
                     filters,
                     self._settings.retrieve_top_k,
                     mode=MODE_HYBRID,
                 )
+                for subquery, vector in pairs
+            ))
+
+            # Merging happens after the gather, in argument order, so the
+            # "best score wins" rule is deterministic rather than dependent on
+            # which response arrived first.
+            merged: dict[str, Hit] = {}
+            for (subquery, _), found in zip(pairs, results):
                 for hit in found:
                     existing = merged.get(hit.chunk.chunk_id)
                     if existing is None or hit.score > existing.score:
@@ -178,6 +193,7 @@ class Retriever:
 
             candidates = sorted(merged.values(), key=lambda h: -h.score)
             st["candidates"] = len(candidates)
+            st["subqueries_searched"] = len(pairs)
 
         if not candidates:
             return RetrievalOutcome(
@@ -204,7 +220,7 @@ class Retriever:
             candidates = self._interleave_by_subquery(
                 candidates, subqueries, len(candidates)
             )
-            candidates, method = rerank(standalone, candidates, self._llm)
+            candidates, method = await rerank(standalone, candidates, self._llm)
             st["method"] = method
             trace["rerank_method"] = method
 

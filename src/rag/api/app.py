@@ -14,6 +14,7 @@ Endpoints
 
 from __future__ import annotations
 
+import asyncio
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -63,12 +64,15 @@ async def lifespan(app: FastAPI):
     configure_logging(settings.log_level, settings.log_format)
     log.info("starting api", profile=settings.profile,
              backend=settings.retriever_backend)
-    _service = AssistantService(settings)
-    if _service.backend.stats().chunks == 0:
+    _service = await AssistantService.create(settings)
+    if (await _service.backend.stats()).chunks == 0:
         log.warning(
             "index is empty - run `python scripts/ingest.py` before asking questions"
         )
     yield
+    # Connection pools outlive the process otherwise, and an unclosed
+    # AsyncClient leaks its sockets.
+    await _service.aclose()
     log.info("shutting down api")
 
 
@@ -153,6 +157,32 @@ if STATIC_DIR.exists():
 # --------------------------------------------------------------------------
 
 
+# NOTE ON `async def` BELOW.
+#
+# The handlers are `async def` and they genuinely await: `service.ask()` is a
+# coroutine all the way down to `httpx.AsyncClient`. A request that is waiting
+# on Azure OpenAI or Azure AI Search -- which is ~95% of its ~5s life -- holds a
+# coroutine, not a thread, so a replica's concurrency ceiling is set by memory
+# rather than by a ~40-worker threadpool.
+#
+# This is the third state of this code, and the middle one is the trap:
+#
+#   1. `async def` over blocking calls  -- ran ON the loop, one request at a
+#      time. Measured: 4 concurrent requests took 4.56x a single request.
+#   2. plain `def` over blocking calls  -- FastAPI's anyio threadpool. Correct,
+#      and the right fix while the internals were still synchronous, but capped
+#      at ~40 in-flight requests. Measured: /health p95 hit 641ms under 60
+#      concurrent requests, because probes queued behind saturated workers.
+#   3. `async def` over awaited calls   -- what this is now.
+#
+# State 1 and state 3 look identical at the signature. What makes state 3 safe
+# is that nothing underneath blocks: work with no network in it (local BM25
+# scoring, feature hashing, PDF parsing, index writes) is dispatched with
+# `asyncio.to_thread` rather than merely relabelled `async`.
+#
+# The middleware was always `async`, because it really does await `call_next`.
+
+
 @app.get("/", include_in_schema=False)
 async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "chat.html")
@@ -166,7 +196,7 @@ async def health() -> JSONResponse:
     with an empty index take traffic and answer every question with
     "I don't know".
     """
-    report = get_service().health()
+    report = await get_service().health()
     code = (status.HTTP_200_OK if report["status"] == "ready"
             else status.HTTP_503_SERVICE_UNAVAILABLE)
     return JSONResponse(status_code=code, content=report)
@@ -181,7 +211,7 @@ async def chat(
     service = get_service()
     history = [Turn(role=t.role, content=t.content) for t in request.history]
 
-    answer = service.ask(
+    answer = await service.ask(
         request.question,
         history=history,
         principal=principal,
@@ -201,7 +231,10 @@ async def documents(
 ) -> list[DocumentModel]:
     """List indexed documents visible to the caller."""
     service = get_service()
-    manifest = Manifest(service.settings.manifest_path()).load()
+    # Reading the manifest is a blocking file read; it belongs off the loop.
+    manifest = await asyncio.to_thread(
+        lambda: Manifest(service.settings.manifest_path()).load()
+    )
 
     result: list[DocumentModel] = []
     for entry in sorted(manifest.entries.values(), key=lambda e: e.doc_id):
@@ -233,7 +266,7 @@ async def ingest(
     require_admin(principal)
     service = get_service()
 
-    report = sync(
+    report = await sync(
         service.settings,
         service.backend,
         service.embedder,

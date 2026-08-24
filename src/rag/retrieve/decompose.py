@@ -94,13 +94,13 @@ def _heuristic_decompose(query: str) -> list[str]:
     return [cleaned]
 
 
-def decompose_query(query: str, llm: ChatProvider) -> list[str]:
+async def decompose_query(query: str, llm: ChatProvider) -> list[str]:
     """Return 1..3 sub-queries. A single-element list means no decomposition."""
     if not looks_multi_hop(query):
         return [query.strip()]
 
     if llm.available:
-        result = llm.complete(
+        result = await llm.complete(
             [
                 {"role": "system", "content": _DECOMPOSE_SYSTEM},
                 {"role": "user", "content": query},

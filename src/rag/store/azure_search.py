@@ -26,6 +26,7 @@ from typing import Any
 from rag.config import Settings
 from rag.models import Chunk, Hit
 from rag.observability.tracing import get_logger
+from rag.providers.http import aclose as http_aclose
 from rag.providers.http import make_client
 from rag.store.base import (
     MODE_HYBRID,
@@ -41,6 +42,10 @@ UPLOAD_BATCH = 100
 VECTOR_PROFILE = "hnsw-profile"
 VECTOR_ALGORITHM = "hnsw-config"
 SEMANTIC_CONFIG = "default-semantic"
+
+# Facets return at most this many buckets. Any count that reaches it is a
+# lower bound, not a total.
+FACET_LIMIT = 1000
 
 # Azure's semantic reranker scores 0-4; the rest of this codebase reasons in
 # 0-10, including the abstention threshold, so scores are rescaled on the way in.
@@ -81,9 +86,9 @@ class AzureAISearchStore:
     def _url(self, path: str) -> str:
         return f"{self._settings.search_endpoint}{path}?api-version={self._api}"
 
-    def _request(self, method: str, path: str,
-                 payload: dict[str, Any] | None = None) -> Any:
-        response = self._client.request(
+    async def _request(self, method: str, path: str,
+                       payload: dict[str, Any] | None = None) -> Any:
+        response = await self._client.request(
             method, self._url(path), json=payload, headers=self._headers
         )
         if response.status_code in (200, 201, 204):
@@ -171,12 +176,12 @@ class AzureAISearchStore:
             },
         }
 
-    def ensure_index(self, dimensions: int) -> None:
+    async def ensure_index(self, dimensions: int) -> None:
         self._dimensions = dimensions
         definition = self._index_definition(dimensions)
         # PUT is create-or-update and is idempotent, which is what we want on
         # every ingest run.
-        self._request("PUT", f"/indexes/{self._index}", definition)
+        await self._request("PUT", f"/indexes/{self._index}", definition)
         log.info("azure ai search index ensured", index=self._index,
                  dimensions=dimensions, semantic=self._semantic_enabled)
 
@@ -210,10 +215,10 @@ class AzureAISearchStore:
             "content_vector": vector,
         }
 
-    def _index_batch(self, actions: list[dict[str, Any]]) -> None:
+    async def _index_batch(self, actions: list[dict[str, Any]]) -> None:
         for start in range(0, len(actions), UPLOAD_BATCH):
             batch = actions[start:start + UPLOAD_BATCH]
-            result = self._request(
+            result = await self._request(
                 "POST", f"/indexes/{self._index}/docs/index", {"value": batch}
             )
             failures = [
@@ -224,18 +229,18 @@ class AzureAISearchStore:
                           count=len(failures),
                           first=failures[0].get("errorMessage", "")[:200])
 
-    def upsert(self, chunks: list[Chunk], vectors: list[list[float]]) -> int:
+    async def upsert(self, chunks: list[Chunk], vectors: list[list[float]]) -> int:
         if not chunks:
             return 0
         actions = [self._to_document(c, v) for c, v in zip(chunks, vectors)]
-        self._index_batch(actions)
+        await self._index_batch(actions)
         return len(actions)
 
-    def _chunk_ids_for_doc(self, doc_id: str) -> list[str]:
+    async def _chunk_ids_for_doc(self, doc_id: str) -> list[str]:
         ids: list[str] = []
         skip = 0
         while True:
-            result = self._request(
+            result = await self._request(
                 "POST",
                 f"/indexes/{self._index}/docs/search",
                 {
@@ -252,26 +257,26 @@ class AzureAISearchStore:
                 return ids
             skip += 1000
 
-    def delete_by_doc(self, doc_id: str) -> int:
-        ids = self._chunk_ids_for_doc(doc_id)
+    async def delete_by_doc(self, doc_id: str) -> int:
+        ids = await self._chunk_ids_for_doc(doc_id)
         if not ids:
             return 0
-        self._index_batch(
+        await self._index_batch(
             [{"@search.action": "delete", "chunk_id": cid} for cid in ids]
         )
         return len(ids)
 
-    def patch_document_fields(self, doc_id: str, fields: dict[str, Any]) -> int:
+    async def patch_document_fields(self, doc_id: str, fields: dict[str, Any]) -> int:
         """Merge metadata onto a document's chunks without re-embedding them.
 
         ``merge`` leaves ``content_vector`` untouched, which is the whole point:
         marking a 2026 rate card superseded because a 2027 one arrived must not
         cost a single embedding call.
         """
-        ids = self._chunk_ids_for_doc(doc_id)
+        ids = await self._chunk_ids_for_doc(doc_id)
         if not ids:
             return 0
-        self._index_batch(
+        await self._index_batch(
             [{"@search.action": "merge", "chunk_id": cid, **fields} for cid in ids]
         )
         return len(ids)
@@ -329,7 +334,7 @@ class AzureAISearchStore:
                           if reranker is not None else None),
         )
 
-    def search(
+    async def search(
         self,
         query: str,
         vector: list[float] | None,
@@ -371,7 +376,7 @@ class AzureAISearchStore:
             payload["semanticConfiguration"] = SEMANTIC_CONFIG
 
         try:
-            result = self._request(
+            result = await self._request(
                 "POST", f"/indexes/{self._index}/docs/search", payload
             )
         except RuntimeError as exc:
@@ -386,7 +391,7 @@ class AzureAISearchStore:
                 self._semantic_failed = True
                 payload.pop("queryType", None)
                 payload.pop("semanticConfiguration", None)
-                result = self._request(
+                result = await self._request(
                     "POST", f"/indexes/{self._index}/docs/search", payload
                 )
             else:
@@ -396,14 +401,14 @@ class AzureAISearchStore:
 
     # ------------------------------------------------------------------
 
-    def _facets(self, fields: list[str]) -> dict[str, dict[str, int]]:
+    async def _facets(self, fields: list[str]) -> dict[str, dict[str, int]]:
         """Facet counts for the whole index, in one request."""
-        result = self._request(
+        result = await self._request(
             "POST",
             f"/indexes/{self._index}/docs/search",
             {
                 "search": "*",
-                "facets": [f"{f},count:1000" for f in fields],
+                "facets": [f"{f},count:{FACET_LIMIT}" for f in fields],
                 "top": 0,
             },
         )
@@ -413,33 +418,68 @@ class AzureAISearchStore:
             for field in fields
         }
 
-    def document_ids(self) -> list[str]:
-        return sorted(self._facets(["doc_id"])["doc_id"])
+    async def document_ids(self) -> list[str]:
+        return sorted((await self._facets(["doc_id"]))["doc_id"])
 
-    def stats(self) -> IndexStats:
+    async def stats(self, *, full: bool = False) -> IndexStats:
+        """Index statistics.
+
+        ``full=False`` issues a single ``$count`` and nothing else. That matters
+        because ``/health`` calls this, and a readiness probe polled every few
+        seconds must not run an aggregation across tens of millions of documents.
+
+        ``full=True`` adds the facet query that yields document and table counts,
+        and is for ingest reporting and startup — once, not per probe.
+        """
         try:
-            counted = self._request(
+            counted = await self._request(
                 "GET", f"/indexes/{self._index}/docs/$count"
             )
             chunks = int(counted) if counted is not None else 0
         except (RuntimeError, ValueError):
             chunks = 0
 
+        if not full:
+            return IndexStats(
+                backend=self.name,
+                chunks=chunks,
+                documents=0,
+                documents_exact=False,      # not computed, not zero
+                dimensions=self._dimensions,
+                embedding_provider=self._embedding_provider,
+                profile=self._settings.profile,
+                extra={
+                    "index": self._index,
+                    "semantic": self._semantic_enabled and not self._semantic_failed,
+                },
+            )
+
         # doc_id and content_type in one facet request. Reporting table_chunks
         # here keeps the ingest summary identical across backends -- without it
         # the Azure path reports "0 tables" for an index that has plenty.
-        documents, table_chunks = 0, 0
+        documents, table_chunks, exact = 0, 0, True
         try:
-            facets = self._facets(["doc_id", "content_type"])
+            facets = await self._facets(["doc_id", "content_type"])
             documents = len(facets["doc_id"])
             table_chunks = facets["content_type"].get("table", 0)
+            # A facet returns at most FACET_LIMIT buckets. Hitting the cap means
+            # "at least this many", not "exactly this many" -- reporting the
+            # capped number as a count is silently wrong past the limit.
+            exact = documents < FACET_LIMIT
+            if not exact:
+                log.warning(
+                    "document count is a lower bound: the facet limit was reached",
+                    limit=FACET_LIMIT,
+                    hint="enumerate doc_ids from the ingestion manifest instead",
+                )
         except RuntimeError:
-            pass
+            exact = False
 
         return IndexStats(
             backend=self.name,
             chunks=chunks,
             documents=documents,
+            documents_exact=exact,
             dimensions=self._dimensions,
             embedding_provider=self._embedding_provider,
             profile=self._settings.profile,
@@ -450,5 +490,8 @@ class AzureAISearchStore:
             },
         )
 
-    def save(self) -> None:
+    async def save(self) -> None:
         """No-op: the service is the store."""
+
+    async def aclose(self) -> None:
+        await http_aclose(self._client)

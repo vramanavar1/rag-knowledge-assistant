@@ -19,6 +19,7 @@ Exits non-zero if any assertion fails, so it can run in CI.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import sys
@@ -95,7 +96,7 @@ def modify_password_policy(path: Path) -> None:
     document.save(str(path))
 
 
-def main() -> int:
+async def _main() -> int:
     from rag.config import get_settings
     from rag.ingest.manifest import Manifest
     from rag.ingest.sync import sync
@@ -115,13 +116,13 @@ def main() -> int:
     os.environ["RAG_PROFILE"] = "improved"
     settings = get_settings(refresh=True)
 
-    def ingest():
+    async def ingest():
         set_correlation_id(None)
         start_trace()
-        embedder = get_embedding_provider(settings)
+        embedder = await get_embedding_provider(settings)
         store = LocalHybridStore(settings.index_path(), profile=settings.profile)
-        store.load()
-        report = sync(settings, store, embedder, source_dir=source)
+        await store.load()
+        report = await sync(settings, store, embedder, source_dir=source)
         return report, store
 
     def manifest() -> Manifest:
@@ -131,7 +132,7 @@ def main() -> int:
 
     # ---------------------------------------------------------------- 1
     print("1. First ingest")
-    report, store = ingest()
+    report, store = await ingest()
     check("all documents indexed", len(report.new) == 11, f"{len(report.new)} new")
     check("chunks written", report.chunks_written > 100,
           f"{report.chunks_written} chunks")
@@ -143,7 +144,7 @@ def main() -> int:
 
     # ---------------------------------------------------------------- 2
     print("\n2. Re-ingest with no source changes")
-    report, store = ingest()
+    report, store = await ingest()
     check("nothing reparsed",
           not report.new and not report.modified and not report.deleted,
           report.render().splitlines()[1].strip())
@@ -162,7 +163,7 @@ def main() -> int:
     old_password_chunk_ids = set(before.entries["IT/PasswordPolicy.docx"].chunk_ids)
     pricing2026_hash_before = before.entries["Sales/Pricing2026.pdf"].content_hash
 
-    report, store = ingest()
+    report, store = await ingest()
     print("   " + report.render().replace("\n", "\n   "))
 
     check("classified correctly",
@@ -181,7 +182,7 @@ def main() -> int:
           "IT/VPNGuide.pdf" not in manifest().entries)
     check("deleted document not retrievable",
           all(h.chunk.doc_id != "IT/VPNGuide.pdf"
-              for h in store.search("How do I connect to the NorthLink VPN?",
+              for h in await store.search("How do I connect to the NorthLink VPN?",
                                     None, __import__("rag.store.base",
                                                      fromlist=["SearchFilters"])
                                     .SearchFilters(), 10, "keyword")))
@@ -223,7 +224,7 @@ def main() -> int:
     # ---------------------------------------------------------------- 4
     print("\n4. Remove Pricing2027.pdf again")
     (source / "Sales" / "Pricing2027.pdf").unlink()
-    report, store = ingest()
+    report, store = await ingest()
     entries = manifest().entries
     check("2026 rate card reinstated as current",
           entries["Sales/Pricing2026.pdf"].meta["is_current"] is True,
@@ -240,6 +241,10 @@ def main() -> int:
         return 1
     print("All lifecycle checks passed.")
     return 0
+
+
+def main() -> int:
+    return asyncio.run(_main())
 
 
 if __name__ == "__main__":

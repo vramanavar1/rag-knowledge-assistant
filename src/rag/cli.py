@@ -16,6 +16,7 @@ the quickest way to see a failure scenario and its fix.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -93,15 +94,19 @@ def _render(answer: Answer, show_hits: bool = False) -> None:
               f"cache={trace.get('cache')}")
 
 
-def cmd_ask(args: argparse.Namespace) -> int:
-    service = AssistantService(get_settings(refresh=True))
-    answer = service.ask(args.question, principal=_principal(args.department))
+async def cmd_ask(args: argparse.Namespace) -> int:
+    service = await AssistantService.create(get_settings(refresh=True))
+    try:
+        answer = await service.ask(args.question,
+                                   principal=_principal(args.department))
+    finally:
+        await service.aclose()
     _render(answer, args.show_hits)
     return 0
 
 
-def cmd_chat(args: argparse.Namespace) -> int:
-    service = AssistantService(get_settings(refresh=True))
+async def cmd_chat(args: argparse.Namespace) -> int:
+    service = await AssistantService.create(get_settings(refresh=True))
     principal = _principal(args.department)
     history: list[Turn] = []
 
@@ -111,20 +116,23 @@ def cmd_chat(args: argparse.Namespace) -> int:
             question = input("you > ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
+            await service.aclose()
             return 0
         if not question:
             continue
         if question.lower() in {"exit", "quit"}:
+            await service.aclose()
             return 0
 
-        answer = service.ask(question, history=history, principal=principal)
+        answer = await service.ask(question, history=history,
+                                   principal=principal)
         _render(answer, args.show_hits)
         print()
         history.append(Turn("user", question))
         history.append(Turn("assistant", answer.text))
 
 
-def cmd_compare(args: argparse.Namespace) -> int:
+async def cmd_compare(args: argparse.Namespace) -> int:
     for profile in ("baseline", "improved"):
         os.environ["RAG_PROFILE"] = profile
         settings = get_settings(refresh=True)
@@ -132,8 +140,13 @@ def cmd_compare(args: argparse.Namespace) -> int:
         print(f"PROFILE: {profile}")
         print("=" * 72)
         try:
-            service = AssistantService(settings)
-            answer = service.ask(args.question, principal=_principal(args.department))
+            service = await AssistantService.create(settings)
+            try:
+                answer = await service.ask(
+                    args.question, principal=_principal(args.department)
+                )
+            finally:
+                await service.aclose()
             _render(answer, args.show_hits)
         except Exception as exc:
             print(f"  failed: {exc}")
@@ -141,7 +154,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+async def _main(argv: list[str] | None = None) -> int:
     # prog is derived from argv[0], so usage reflects however it was invoked
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--department", choices=[*DEPARTMENTS, "all"], default="all",
@@ -167,7 +180,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.profile:
         os.environ["RAG_PROFILE"] = args.profile
     configure_logging(args.log_level, "text")
-    return args.func(args)
+    return await args.func(args)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Sync entry point. The pipeline is async, so the loop starts here."""
+    return asyncio.run(_main(argv))
 
 
 if __name__ == "__main__":

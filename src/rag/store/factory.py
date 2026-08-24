@@ -14,7 +14,8 @@ from rag.store.local import LocalHybridStore
 log = get_logger(__name__)
 
 
-def get_backend(settings: Settings) -> SearchBackend:
+async def get_backend(settings: Settings) -> SearchBackend:
+    """Async because the local backend loads its index from disk to construct."""
     if settings.retriever_backend == "azure":
         if not settings.has_azure_search:
             log.warning(
@@ -30,7 +31,7 @@ def get_backend(settings: Settings) -> SearchBackend:
             return store
 
     store = LocalHybridStore(settings.index_path(), profile=settings.profile)
-    store.load()
+    await store.load()
     log.info("search backend active", backend=store.name,
              path=str(settings.index_path()))
     return store

@@ -100,7 +100,7 @@ def _heuristic_condense(query: str, history: list[Turn]) -> str:
     return f"{query.strip().rstrip('?')} (regarding: {previous.strip().rstrip('?')})?"
 
 
-def condense_query(
+async def condense_query(
     query: str,
     history: list[Turn],
     llm: ChatProvider,
@@ -116,7 +116,7 @@ def condense_query(
             f"{'User' if turn.role == 'user' else 'Assistant'}: {turn.content[:400]}"
             for turn in recent
         )
-        result = llm.complete(
+        result = await llm.complete(
             [
                 {"role": "system", "content": _CONDENSE_SYSTEM},
                 {

@@ -227,7 +227,7 @@ def validate_citations(answer: str, source_count: int) -> tuple[bool, list[int]]
     return (not invalid and bool(markers)), invalid
 
 
-def verify_groundedness(
+async def verify_groundedness(
     answer: str,
     sources: list[Hit],
     context: str,
@@ -247,7 +247,7 @@ def verify_groundedness(
         score -= 0.2
 
     if llm.available:
-        result = llm.complete(
+        result = await llm.complete(
             [
                 {"role": "system", "content":
                  "You check whether an answer is supported by its sources.\n"

@@ -32,6 +32,7 @@ import json
 import math
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -210,9 +211,14 @@ class AzureSearchStub:
     """
 
     def __init__(self, *, api_key: str = "stub-key",
-                 reject_semantic: bool = False) -> None:
+                 reject_semantic: bool = False,
+                 delay_s: float = 0.0) -> None:
         self.api_key = api_key
         self.reject_semantic = reject_semantic
+        # Models the round-trip latency of the real service. Without it every
+        # call returns in microseconds, which hides exactly the behaviour a
+        # concurrency measurement is trying to observe.
+        self.delay_s = delay_s
         self.indexes: dict[str, StubIndex] = {}
         self.requests: list[dict[str, Any]] = []
         self._server: ThreadingHTTPServer | None = None
@@ -250,6 +256,8 @@ class AzureSearchStub:
                     self.wfile.write(data)
 
             def _handle(self, method: str) -> None:
+                if stub.delay_s:
+                    time.sleep(stub.delay_s)
                 parsed = urlparse(self.path)
                 path = unquote(parsed.path)
                 body = self._body()

@@ -16,12 +16,27 @@ discount"; BM25 is the reverse. RRF fuses the two rankings without needing the
 scores to be on a comparable scale, which is exactly the property that makes it
 robust when one of the two retrievers is weak -- including when the local
 embedder is standing in for a real embedding model.
+
+Async, but CPU-bound
+--------------------
+This store satisfies an async ``SearchBackend`` protocol while doing no network
+I/O at all: scoring is arithmetic over in-memory dicts.  That combination is a
+trap.  An ``async def`` that runs CPU work inline holds the event loop for its
+whole duration, so a single search would stall every other in-flight request --
+strictly worse than the threadpool it replaced.
+
+So the scoring bodies stay synchronous and are dispatched with
+``asyncio.to_thread``.  The ``threading.Lock`` around ``_rebuild`` is what makes
+that safe, and matters more now than it did before: the work really does run on
+worker threads.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
@@ -68,6 +83,10 @@ class LocalHybridStore:
         self._doc_freq: Counter = Counter()
         self._avg_len = 0.0
         self._dirty_index = True
+        # Sub-query searches now run concurrently, so two threads can
+        # reach _ensure_fresh() at once. Rebuilding twice in parallel
+        # would corrupt the term-frequency maps mid-write.
+        self._rebuild_lock = threading.Lock()
 
         # numpy fast path
         self._matrix: Any = None
@@ -77,7 +96,7 @@ class LocalHybridStore:
     # Persistence
     # ------------------------------------------------------------------
 
-    def load(self) -> bool:
+    def load_sync(self) -> bool:
         if not self._path.exists():
             return False
         try:
@@ -98,7 +117,10 @@ class LocalHybridStore:
                  provider=self._embedding_provider)
         return True
 
-    def save(self) -> None:
+    async def load(self) -> bool:
+        return await asyncio.to_thread(self.load_sync)
+
+    def _save_sync(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "profile": self._profile,
@@ -112,11 +134,16 @@ class LocalHybridStore:
         self._path.write_text(json.dumps(payload), encoding="utf-8")
         log.info("index saved", path=str(self._path), chunks=len(self._chunks))
 
+    async def save(self) -> None:
+        # Serialising every chunk and vector to JSON is CPU plus a blocking
+        # write; both belong off the loop.
+        await asyncio.to_thread(self._save_sync)
+
     # ------------------------------------------------------------------
     # Write path
     # ------------------------------------------------------------------
 
-    def ensure_index(self, dimensions: int) -> None:
+    async def ensure_index(self, dimensions: int) -> None:
         if self._dimensions and self._dimensions != dimensions:
             # Mixing vector widths silently produces meaningless similarities.
             log.warning(
@@ -131,14 +158,14 @@ class LocalHybridStore:
     def set_embedding_provider(self, name: str) -> None:
         self._embedding_provider = name
 
-    def upsert(self, chunks: list[Chunk], vectors: list[list[float]]) -> int:
+    async def upsert(self, chunks: list[Chunk], vectors: list[list[float]]) -> int:
         for chunk, vector in zip(chunks, vectors):
             self._chunks[chunk.chunk_id] = chunk
             self._vectors[chunk.chunk_id] = _normalize(vector)
         self._dirty_index = True
         return len(chunks)
 
-    def delete_by_doc(self, doc_id: str) -> int:
+    async def delete_by_doc(self, doc_id: str) -> int:
         victims = [cid for cid, c in self._chunks.items() if c.doc_id == doc_id]
         for chunk_id in victims:
             self._chunks.pop(chunk_id, None)
@@ -157,7 +184,7 @@ class LocalHybridStore:
             self._dirty_index = True
         return removed
 
-    def patch_document_fields(self, doc_id: str, fields: dict[str, Any]) -> int:
+    async def patch_document_fields(self, doc_id: str, fields: dict[str, Any]) -> int:
         patched = 0
         for chunk in self._chunks.values():
             if chunk.doc_id != doc_id:
@@ -199,8 +226,11 @@ class LocalHybridStore:
         self._dirty_index = False
 
     def _ensure_fresh(self) -> None:
-        if self._dirty_index:
-            self._rebuild()
+        if not self._dirty_index:
+            return
+        with self._rebuild_lock:
+            if self._dirty_index:      # re-check: another thread may have won
+                self._rebuild()
 
     # ------------------------------------------------------------------
     # Read path
@@ -256,7 +286,19 @@ class LocalHybridStore:
             scores[chunk_id] = sum(a * b for a, b in zip(stored, query))
         return scores
 
-    def search(
+    async def search(
+        self,
+        query: str,
+        vector: list[float] | None,
+        filters: SearchFilters,
+        top_k: int,
+        mode: str = MODE_HYBRID,
+    ) -> list[Hit]:
+        return await asyncio.to_thread(
+            self._search_sync, query, vector, filters, top_k, mode
+        )
+
+    def _search_sync(
         self,
         query: str,
         vector: list[float] | None,
@@ -307,8 +349,14 @@ class LocalHybridStore:
 
     # ------------------------------------------------------------------
 
-    def document_ids(self) -> list[str]:
+    def _document_ids_sync(self) -> list[str]:
         return sorted({chunk.doc_id for chunk in self._chunks.values()})
+
+    async def document_ids(self) -> list[str]:
+        return self._document_ids_sync()
+
+    async def aclose(self) -> None:
+        """Nothing to release: the index is in memory and the file is closed."""
 
     def chunks_for_doc(self, doc_id: str) -> list[Chunk]:
         return sorted(
@@ -319,11 +367,13 @@ class LocalHybridStore:
     def get_chunk(self, chunk_id: str) -> Chunk | None:
         return self._chunks.get(chunk_id)
 
-    def stats(self) -> IndexStats:
+    async def stats(self, *, full: bool = False) -> IndexStats:
+        # Everything here is an in-memory dict, so `full` costs nothing
+        # extra; the parameter exists to satisfy the protocol.
         return IndexStats(
             backend=self.name,
             chunks=len(self._chunks),
-            documents=len(self.document_ids()),
+            documents=len(self._document_ids_sync()),
             dimensions=self._dimensions,
             embedding_provider=self._embedding_provider,
             profile=self._profile,

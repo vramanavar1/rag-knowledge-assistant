@@ -18,6 +18,7 @@ from typing import Any
 
 from rag.config import Settings
 from rag.observability.tracing import get_logger, record_usage
+from rag.providers.http import aclose as http_aclose
 from rag.providers.http import make_client, post_with_retry
 
 log = get_logger(__name__)
@@ -107,7 +108,7 @@ class ChatProvider:
             f"/chat/completions?api-version={self._settings.aoai_api_version}"
         )
 
-    def complete(
+    async def complete(
         self,
         messages: list[dict[str, str]],
         *,
@@ -153,7 +154,7 @@ class ChatProvider:
         }
 
         try:
-            response = post_with_retry(
+            response = await post_with_retry(
                 self._client, self._url(deployment), payload, headers,
                 what="Azure OpenAI chat completion",
             )
@@ -183,11 +184,14 @@ class ChatProvider:
             raw=data,
         )
 
-    def probe(self) -> bool:
+    async def aclose(self) -> None:
+        await http_aclose(self._client)
+
+    async def probe(self) -> bool:
         """One cheap call to confirm the deployment really answers."""
         if not self.available:
             return False
-        result = self.complete(
+        result = await self.complete(
             [{"role": "user", "content": "Reply with the single word: ok"}],
             max_tokens=5,
             utility=True,

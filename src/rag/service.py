@@ -22,9 +22,10 @@ from rag.observability.tracing import (
     get_logger,
     start_trace,
 )
-from rag.providers.embeddings import get_embedding_provider
-from rag.providers.llm import get_chat_provider
+from rag.providers.embeddings import EmbeddingProvider, get_embedding_provider
+from rag.providers.llm import ChatProvider, get_chat_provider
 from rag.retrieve.pipeline import Retriever
+from rag.store.base import SearchBackend
 from rag.store.factory import get_backend
 
 log = get_logger(__name__)
@@ -78,31 +79,65 @@ class AnswerCache:
 
 
 class AssistantService:
-    def __init__(self, settings: Settings | None = None) -> None:
-        self.settings = settings or get_settings()
-        self.embedder = get_embedding_provider(self.settings)
-        self.backend = get_backend(self.settings)
-        self.llm = get_chat_provider(self.settings)
-        self.llm.probe()
+    """Construct with ``await AssistantService.create(settings)``.
 
-        self.retriever = Retriever(self.settings, self.backend, self.embedder, self.llm)
-        self.generator = AnswerGenerator(self.settings, self.llm)
+    Wiring the service requires I/O -- probing the chat deployment, probing the
+    embedding model for its true vector width, loading the index -- and a
+    ``__init__`` cannot ``await``.  So ``__init__`` only assigns what it is
+    handed, and ``create()`` does the awaiting.  The alternative, blocking
+    inside the constructor, would stall the event loop at startup and make the
+    class unusable from anywhere already inside one.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        embedder: EmbeddingProvider,
+        backend: SearchBackend,
+        llm: ChatProvider,
+    ) -> None:
+        self.settings = settings
+        self.embedder = embedder
+        self.backend = backend
+        self.llm = llm
+
+        self.retriever = Retriever(settings, backend, embedder, llm)
+        self.generator = AnswerGenerator(settings, llm)
         self.cache = AnswerCache()
+        self._health_cache: tuple[float, Any] | None = None
 
-        stats = self.backend.stats()
+    @classmethod
+    async def create(cls, settings: Settings | None = None) -> "AssistantService":
+        settings = settings or get_settings()
+        embedder = await get_embedding_provider(settings)
+        backend = await get_backend(settings)
+        llm = get_chat_provider(settings)
+        await llm.probe()
+
+        service = cls(settings, embedder, backend, llm)
+
+        stats = await backend.stats(full=True)   # once, at startup
         log.info(
             "assistant ready",
-            profile=self.settings.profile,
+            profile=settings.profile,
             backend=stats.backend,
             chunks=stats.chunks,
             documents=stats.documents,
-            embeddings=self.embedder.name,
-            llm=self.llm.name,
+            embeddings=embedder.name,
+            llm=llm.name,
         )
+        return service
+
+    async def aclose(self) -> None:
+        """Release every connection pool the service owns."""
+        for owner in (self.llm, self.embedder, self.backend):
+            closer = getattr(owner, "aclose", None)
+            if closer is not None:
+                await closer()
 
     # ------------------------------------------------------------------
 
-    def ask(
+    async def ask(
         self,
         question: str,
         history: list[Turn] | None = None,
@@ -138,8 +173,8 @@ class AssistantService:
                     trace=trace,
                 )
 
-        outcome = self.retriever.retrieve(question, history, principal)
-        answer = self.generator.generate(question, outcome, history, principal)
+        outcome = await self.retriever.retrieve(question, history, principal)
+        answer = await self.generator.generate(question, outcome, history, principal)
 
         trace = finish_trace()
         answer.trace.update(
@@ -168,15 +203,27 @@ class AssistantService:
 
     # ------------------------------------------------------------------
 
-    def health(self) -> dict[str, Any]:
-        stats = self.backend.stats()
+    # A readiness probe is polled every few seconds per replica, so its cost is
+    # multiplied by replica count and never amortised. Even the cheap `$count`
+    # is worth not issuing on every poll.
+    _HEALTH_TTL_SECONDS = 15.0
+
+    async def health(self) -> dict[str, Any]:
+        now = time.monotonic()
+        if self._health_cache and now - self._health_cache[0] < self._HEALTH_TTL_SECONDS:
+            stats = self._health_cache[1]
+        else:
+            stats = await self.backend.stats()      # cheap path: no aggregation
+            self._health_cache = (now, stats)
         ready = stats.chunks > 0
         return {
             "status": "ready" if ready else "degraded",
             "profile": self.settings.profile,
             "index": {
                 "backend": stats.backend,
-                "documents": stats.documents,
+                # Omitted on the cheap path rather than reported as 0 or as a
+                # capped count that stops being true past the facet limit.
+                "documents": stats.documents if stats.documents_exact else None,
                 "chunks": stats.chunks,
                 "dimensions": stats.dimensions,
                 "embedding_provider": stats.embedding_provider,

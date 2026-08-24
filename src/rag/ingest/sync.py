@@ -22,6 +22,7 @@ re-ingest the file that was replaced.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -99,7 +100,7 @@ def _parse_one(
     return parsed, meta, hints
 
 
-def sync(
+async def sync(
     settings: Settings,
     backend: SearchBackend,
     embedder: EmbeddingProvider,
@@ -122,7 +123,8 @@ def sync(
 
     # ---- 1. classify --------------------------------------------------
     with stage("scan"):
-        changes: ChangeSet = manifest.scan(source_dir)
+        # Hashes every file in the corpus -- disk-bound, so it runs off the loop.
+        changes: ChangeSet = await asyncio.to_thread(manifest.scan, source_dir)
         if force:
             changes.modified += changes.unchanged
             changes.unchanged = []
@@ -138,8 +140,11 @@ def sync(
     with stage("parse") as st:
         for doc_id in changes.touched:
             try:
-                parsed, meta, hint = _parse_one(
-                    doc_id, changes.paths[doc_id], source_dir, changes.hashes[doc_id]
+                # Parsing a PDF is CPU work, not I/O; inline it would hold the
+                # event loop for the whole document.
+                parsed, meta, hint = await asyncio.to_thread(
+                    _parse_one,
+                    doc_id, changes.paths[doc_id], source_dir, changes.hashes[doc_id],
                 )
             except Exception as exc:
                 # One malformed document must not stall the corpus.  In
@@ -177,16 +182,16 @@ def sync(
     with stage("purge") as st:
         purged = 0
         for doc_id in changes.deleted:
-            purged += backend.delete_by_doc(doc_id)
+            purged += await backend.delete_by_doc(doc_id)
             manifest.forget(doc_id)
             log.info("document deleted from index", doc_id=doc_id)
         for doc_id in changes.modified:
-            purged += backend.delete_by_doc(doc_id)
+            purged += await backend.delete_by_doc(doc_id)
         report.chunks_purged = purged
         st["chunks"] = purged
 
     # ---- 5. chunk, embed, upsert --------------------------------------
-    backend.ensure_index(embedder.dimensions)
+    await backend.ensure_index(embedder.dimensions)
     if hasattr(backend, "set_embedding_provider"):
         backend.set_embedding_provider(embedder.name)
 
@@ -206,8 +211,8 @@ def sync(
             if not chunks:
                 log.warning("document produced no chunks", doc_id=doc_id)
 
-            vectors = embedder.embed([c.embed_text for c in chunks]) if chunks else []
-            backend.upsert(chunks, vectors)
+            vectors = await embedder.embed([c.embed_text for c in chunks]) if chunks else []
+            await backend.upsert(chunks, vectors)
             written += len(chunks)
 
             manifest.record(
@@ -237,7 +242,7 @@ def sync(
             if doc_id in changes.touched or doc_id not in manifest.entries:
                 continue
             meta = metas[doc_id]
-            patched += backend.patch_document_fields(
+            patched += await backend.patch_document_fields(
                 doc_id, {"is_current": meta.is_current}
             )
             manifest.update_meta(doc_id, meta)
@@ -256,12 +261,12 @@ def sync(
 
     # ---- 7. persist ---------------------------------------------------
     with stage("persist"):
-        manifest.save()
+        await asyncio.to_thread(manifest.save)
         if hasattr(embedder, "save"):
-            embedder.save()
-        backend.save()
+            await asyncio.to_thread(embedder.save)
+        await backend.save()
 
-    stats = backend.stats()
+    stats = await backend.stats(full=True)
     report.total_chunks = stats.chunks
     report.table_chunks = stats.extra.get("table_chunks", 0)
 

@@ -53,7 +53,7 @@ class AnswerGenerator:
 
     # ------------------------------------------------------------------
 
-    def generate(
+    async def generate(
         self,
         question: str,
         outcome: RetrievalOutcome,
@@ -73,7 +73,7 @@ class AnswerGenerator:
                 was_condensed=outcome.condensed,
             )
             if ambiguity.ambiguous:
-                return self._clarify(question, outcome, ambiguity, base_trace)
+                return await self._clarify(question, outcome, ambiguity, base_trace)
 
             sufficiency = assess_sufficiency(outcome, self._settings)
             base_trace["sufficiency"] = {
@@ -98,7 +98,7 @@ class AnswerGenerator:
             st["dropped"] = len(outcome.hits) - len(used)
 
         with stage("generate") as st:
-            text, generator = self._write(question, context, history)
+            text, generator = await self._write(question, context, history)
             st["generator"] = generator
             st["sources"] = len(used)
         base_trace["generator"] = generator
@@ -111,7 +111,7 @@ class AnswerGenerator:
             )
 
         with stage("verify") as st:
-            groundedness = verify_groundedness(text, used, context, self._llm)
+            groundedness = await verify_groundedness(text, used, context, self._llm)
             st["groundedness"] = groundedness.score
             st["method"] = groundedness.method
         base_trace["groundedness"] = {
@@ -152,14 +152,14 @@ class AnswerGenerator:
     # Writing
     # ------------------------------------------------------------------
 
-    def _write(
+    async def _write(
         self, question: str, context: str, history: list[Turn] | None
     ) -> tuple[str, str]:
         if self._llm.available:
             messages = build_answer_messages(question, context, history)
             if self._settings.is_baseline:
                 messages[0] = {"role": "system", "content": BASELINE_ANSWER_SYSTEM}
-            result = self._llm.complete(
+            result = await self._llm.complete(
                 messages, temperature=0.0, max_tokens=700
             )
             if result and result.text.strip():
@@ -241,12 +241,12 @@ class AnswerGenerator:
             trace=trace | {"abstain_reason": reason},
         )
 
-    def _clarify(
+    async def _clarify(
         self, question: str, outcome: RetrievalOutcome, ambiguity, trace: dict
     ) -> Answer:
         text = ""
         if self._llm.available:
-            result = self._llm.complete(
+            result = await self._llm.complete(
                 build_clarify_messages(question, ambiguity.options),
                 temperature=0.0,
                 max_tokens=250,

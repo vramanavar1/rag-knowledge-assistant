@@ -25,12 +25,24 @@ Retries
 429 and 5xx are retried with exponential backoff, honouring ``Retry-After``.
 Everything else fails fast, because retrying a 401 or a 404 just multiplies the
 latency of a misconfiguration.
+
+Concurrency
+-----------
+The client is ``httpx.AsyncClient``.  Every Azure call in this codebase is
+awaited, so a request that is waiting on the network occupies a coroutine rather
+than a thread -- which is what lets one replica hold thousands of in-flight
+questions instead of the ~40 that a threadpool allows.
+
+The connection pool is the outermost back-pressure valve.  It is deliberately
+finite: ``asyncio.gather`` over a few million embedding batches would otherwise
+try to open all of them at once, and the first thing to break would be the
+Azure OpenAI quota rather than anything this process could see.
 """
 
 from __future__ import annotations
 
+import asyncio
 import ssl
-import time
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +54,17 @@ from rag.observability.tracing import get_logger
 log = get_logger(__name__)
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+# Pool bounds, overridable with AZURE_HTTP_MAX_CONNECTIONS.
+#
+# Sizing matters more than it looks. One question fans out to as many as three
+# concurrent searches, so a replica holding N questions wants ~3N connections.
+# Set it too low and the pool becomes the bottleneck -- and worse, the readiness
+# probe's own call queues behind query traffic, so the orchestrator sees an
+# unhealthy replica exactly when it is busiest. Measured at 64 connections under
+# 60 concurrent questions: /health p50 297ms.
+DEFAULT_MAX_CONNECTIONS = 200
+
 _warned_insecure = False
 
 
@@ -76,15 +99,25 @@ def build_verify(settings: Settings) -> bool | str | ssl.SSLContext:
     return True
 
 
-def make_client(settings: Settings, timeout_s: float = 60.0) -> httpx.Client:
-    return httpx.Client(
+def make_client(settings: Settings, timeout_s: float = 60.0) -> httpx.AsyncClient:
+    """An async client.
+
+    Safe to construct outside a running event loop -- httpx defers creating the
+    connection pool's loop-bound state until the first request -- which is what
+    lets providers keep building their client in ``__init__``.
+    """
+    return httpx.AsyncClient(
         timeout=httpx.Timeout(timeout_s, connect=10.0),
         verify=build_verify(settings),
+        limits=httpx.Limits(
+            max_connections=settings.http_max_connections,
+            max_keepalive_connections=max(8, settings.http_max_connections // 4),
+        ),
     )
 
 
-def post_with_retry(
-    client: httpx.Client,
+async def post_with_retry(
+    client: httpx.AsyncClient,
     url: str,
     payload: dict[str, Any],
     headers: dict[str, str],
@@ -92,17 +125,21 @@ def post_with_retry(
     what: str = "request",
     max_attempts: int = 4,
 ) -> httpx.Response:
-    """POST with backoff on throttling. Raises on permanent failure."""
+    """POST with backoff on throttling. Raises on permanent failure.
+
+    The backoff is ``asyncio.sleep``, so a throttled call yields the event loop
+    to every other in-flight request instead of parking a thread on it.
+    """
     last_error = ""
 
     for attempt in range(max_attempts):
         try:
-            response = client.post(url, json=payload, headers=headers)
+            response = await client.post(url, json=payload, headers=headers)
         except httpx.HTTPError as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             if attempt == max_attempts - 1:
                 break
-            time.sleep(min(2 ** attempt, 8))
+            await asyncio.sleep(min(2 ** attempt, 8))
             continue
 
         if response.status_code == 200:
@@ -115,7 +152,7 @@ def post_with_retry(
             if attempt == max_attempts - 1:
                 last_error = f"{response.status_code} after {max_attempts} attempts"
                 break
-            time.sleep(delay)
+            await asyncio.sleep(delay)
             continue
 
         raise RuntimeError(
@@ -123,3 +160,15 @@ def post_with_retry(
         )
 
     raise RuntimeError(f"{what} unreachable: {last_error}")
+
+
+async def aclose(*clients: httpx.AsyncClient | None) -> None:
+    """Release connection pools. An unclosed AsyncClient leaks its sockets."""
+    for client in clients:
+        if client is None:
+            continue
+        try:
+            await client.aclose()
+        except Exception:                                       # noqa: BLE001
+            # Shutdown must not raise; a half-closed pool is the OS's problem.
+            log.debug("error closing http client", exc_info=True)

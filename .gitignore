@@ -17,6 +17,8 @@ dist/
 venv/
 .pytest_cache/
 .mypy_cache/
+prd.md
+errorlog.txt
 
 # --- build artefacts ---
 # generated index, ingestion manifest and embedding cache

@@ -30,6 +30,7 @@ Both profiles must have been ingested first:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -85,10 +86,10 @@ def principal_for(department: str) -> Principal:
     )
 
 
-def judge(llm: ChatProvider, case: dict[str, Any], answer_text: str) -> tuple[int | None, str]:
+async def judge(llm: ChatProvider, case: dict[str, Any], answer_text: str) -> tuple[int | None, str]:
     if not llm.available:
         return None, ""
-    result = llm.complete(
+    result = await llm.complete(
         [
             {"role": "system", "content": JUDGE_SYSTEM},
             {
@@ -114,13 +115,13 @@ def judge(llm: ChatProvider, case: dict[str, Any], answer_text: str) -> tuple[in
     return None, ""
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
+async def run(args: argparse.Namespace) -> dict[str, Any]:
     os.environ["RAG_PROFILE"] = args.profile
     settings = get_settings(refresh=True)
     configure_logging(args.log_level, "text")
 
-    service = AssistantService(settings)
-    stats = service.backend.stats()
+    service = await AssistantService.create(settings)
+    stats = await service.backend.stats()
     if stats.chunks == 0:
         raise SystemExit(
             f"No index for profile '{args.profile}'. "
@@ -149,7 +150,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for attempt in range(max(1, args.repeat)):
             started = time.perf_counter()
             try:
-                answer = service.ask(
+                answer = await service.ask(
                     case["question"],
                     history=history,
                     principal=principal,
@@ -174,7 +175,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         result = score_case(case, answer, latency, top_k=settings.context_top_k)
 
         if not args.no_judge:
-            result.judge_score, result.judge_reason = judge(
+            result.judge_score, result.judge_reason = await judge(
                 service.llm, case, answer.text
             )
 
@@ -476,7 +477,7 @@ def _snippet(text: str, limit: int = 110) -> str:
     return (text[:limit] + "…") if len(text) > limit else text
 
 
-def main() -> int:
+async def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--profile", choices=["baseline", "improved"], default="improved")
@@ -504,8 +505,12 @@ def main() -> int:
         )
         return 0
 
-    run(args)
+    await run(args)
     return 0
+
+
+def main() -> int:
+    return asyncio.run(_main())
 
 
 if __name__ == "__main__":

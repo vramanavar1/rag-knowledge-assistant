@@ -192,7 +192,10 @@ async function boot() {
     const r = await fetch('/health');
     const h = await r.json();
     const pill = document.getElementById('health');
-    pill.textContent = `${h.index.documents} docs · ${h.index.chunks} chunks · ${h.profile} · ${h.providers.llm_available ? 'LLM live' : 'no LLM'}`;
+    // `documents` is null when the backend skipped the aggregation that counts
+    // it — the health probe takes the cheap path deliberately.
+    const docs = h.index.documents === null ? '' : `${h.index.documents} docs · `;
+    pill.textContent = `${docs}${h.index.chunks} chunks · ${h.profile} · ${h.providers.llm_available ? 'LLM live' : 'no LLM'}`;
     pill.className = 'pill ' + (h.status === 'ready' ? 'live' : 'degraded');
   } catch { document.getElementById('health').textContent = 'API unreachable'; }
 

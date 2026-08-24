@@ -12,6 +12,7 @@ calls; the summary line reports that explicitly.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -32,7 +33,7 @@ from rag.providers.embeddings import get_embedding_provider           # noqa: E4
 from rag.store.factory import get_backend                             # noqa: E402
 
 
-def main() -> int:
+async def _main() -> int:
     parser = argparse.ArgumentParser(description="Ingest the knowledge base.")
     parser.add_argument("--source", type=Path, default=None,
                         help="source directory (default: RAG_SOURCE_DIR)")
@@ -72,10 +73,10 @@ def main() -> int:
             )
         return 0
 
-    embedder = get_embedding_provider(settings)
-    backend = get_backend(settings)
+    embedder = await get_embedding_provider(settings)
+    backend = await get_backend(settings)
 
-    report = sync(
+    report = await sync(
         settings,
         backend,
         embedder,
@@ -90,7 +91,15 @@ def main() -> int:
     print(f"  stages: {timings}")
     print(f"  total: {trace['total_ms']}ms")
 
+    closer = getattr(backend, "aclose", None)
+    if closer is not None:
+        await closer()
+
     return 1 if report.failed else 0
+
+
+def main() -> int:
+    return asyncio.run(_main())
 
 
 if __name__ == "__main__":

@@ -65,6 +65,9 @@ class Settings:
     azure_ca_bundle: str = ""
     azure_use_system_certs: bool = False
     azure_tls_verify: bool = True
+    # HTTP connection pool per provider, and the embedding fan-out width.
+    http_max_connections: int = 200
+    embed_concurrency: int = 8
 
     # ---- Azure AI Search --------------------------------------------------
     retriever_backend: str = "local"          # local | azure
@@ -163,6 +166,10 @@ def _load() -> Settings:
     s.azure_ca_bundle = _env("AZURE_CA_BUNDLE")
     s.azure_use_system_certs = _env_bool("AZURE_USE_SYSTEM_CERTS", False)
     s.azure_tls_verify = _env_bool("AZURE_TLS_VERIFY", True)
+    s.http_max_connections = _env_int("AZURE_HTTP_MAX_CONNECTIONS",
+                                      s.http_max_connections)
+    s.embed_concurrency = _env_int("AZURE_EMBED_CONCURRENCY",
+                                   s.embed_concurrency)
 
     s.retriever_backend = _env("RETRIEVER_BACKEND", "local").lower()
     s.search_endpoint = _env("AZURE_SEARCH_ENDPOINT").rstrip("/")

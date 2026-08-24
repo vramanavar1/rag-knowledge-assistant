@@ -30,6 +30,7 @@ python scripts/verify_pipeline.py     # 9/9 stages, 52-53 checks
 | **Deployment — local, Azure, production** | [Deployment.md](Deployment.md) |
 | Pipeline coverage — all nine stages | [docs/pipeline.md](docs/pipeline.md) |
 | Production architecture (Step 2) | [docs/architecture.md](docs/architecture.md) · [PDF](docs/architecture.pdf) |
+| Scale review — millions of documents, token cost | [docs/scale-review.md](docs/scale-review.md) |
 | Document lifecycle: add / modify / delete | [docs/ingestion-flow.md](docs/ingestion-flow.md) |
 | The six failure scenarios (Step 3) | [docs/failure-scenarios.md](docs/failure-scenarios.md) |
 | Evaluation, baseline vs improved (Step 4) | [docs/evaluation.md](docs/evaluation.md) · [eval/results/comparison.md](eval/results/comparison.md) |
@@ -353,16 +354,17 @@ answer** so time-to-first-token stays flat even when total time grows, and a
 
 > *From 10,000 documents to 5 million. What changes?*
 
-Covered in full in [docs/architecture.md](docs/architecture.md#scale). The
-summary:
+Covered in full in [docs/architecture.md](docs/architecture.md#scale), with the
+measured projections and the gap register in
+[docs/scale-review.md](docs/scale-review.md). The summary:
 
 - **Partition and shard the index** along the same boundary as the security
   model (department / business unit / tenant), so each query touches one index
   and filters stay cheap.
 - **Compress the vectors** — scalar or binary quantization, plus reduced
-  dimensions (`text-embedding-3-small` at 512 rather than 1536). At 500M chunks
-  the raw float32 storage is ~3 TB; this is the difference between feasible and
-  not.
+  dimensions (`text-embedding-3-small` at 512 rather than 1536). At the measured
+  11.5 chunks/document, 5M documents is ~58M chunks and ~355 GB of raw float32 —
+  int8 takes that to ~89 GB, and 512 dims to ~30 GB.
 - **Two-stage retrieval** — cheap compressed ANN for recall, full-precision
   rescoring on the top few hundred.
 - **Ingestion becomes a pipeline product** — durable orchestration, TPM-aware

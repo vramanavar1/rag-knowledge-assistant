@@ -20,6 +20,7 @@ index is untouched. Exits non-zero on any failure, so it can gate CI.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import math
 import os
 import shutil
@@ -177,25 +178,25 @@ def stage_3_chunking(source: Path, changes, parsed):
     return chunks
 
 
-def stage_4_embeddings(settings, chunks):
+async def stage_4_embeddings(settings, chunks):
     from rag.observability.tracing import current_trace
     from rag.providers.embeddings import get_embedding_provider
 
     stage = STAGES[3]
     heading(stage)
 
-    embedder = get_embedding_provider(settings)
+    embedder = await get_embedding_provider(settings)
     sample = [c.embed_text for c in chunks[:8]]
 
     before = (current_trace() or {}).get("cache_hits", 0)
-    vectors = embedder.embed(sample)
+    vectors = await embedder.embed(sample)
     fresh_hits = (current_trace() or {}).get("cache_hits", 0) - before
 
     dimensions = {len(v) for v in vectors}
     norms = [math.sqrt(sum(x * x for x in v)) for v in vectors]
 
     before = (current_trace() or {}).get("cache_hits", 0)
-    embedder.embed(sample)
+    await embedder.embed(sample)
     cached_hits = (current_trace() or {}).get("cache_hits", 0) - before
 
     check(stage, "one vector per chunk", len(vectors) == len(sample),
@@ -218,7 +219,7 @@ def stage_4_embeddings(settings, chunks):
     return embedder
 
 
-def stage_5_azure_search(chunks, embedder):
+async def stage_5_azure_search(chunks, embedder):
     """Exercise AzureAISearchStore against the offline REST stub."""
     from rag.config import get_settings
     from rag.store.azure_search import AzureAISearchStore
@@ -235,7 +236,7 @@ def stage_5_azure_search(chunks, embedder):
     for chunk in chunks:
         by_department.setdefault(chunk.department, []).append(chunk)
     sample = [c for group in by_department.values() for c in group[:8]]
-    vectors = embedder.embed([c.embed_text for c in sample])
+    vectors = await embedder.embed([c.embed_text for c in sample])
 
     with AzureSearchStub() as stub:
         os.environ["AZURE_SEARCH_ENDPOINT"] = stub.endpoint
@@ -245,7 +246,7 @@ def stage_5_azure_search(chunks, embedder):
         store = AzureAISearchStore(get_settings(refresh=True))
 
         # --- index definition -------------------------------------------
-        store.ensure_index(embedder.dimensions)
+        await store.ensure_index(embedder.dimensions)
         definition = stub.index("verify-kb").definition
         fields = {f["name"]: f for f in definition.get("fields", [])}
         vector_field = fields.get("content_vector", {})
@@ -270,18 +271,18 @@ def stage_5_azure_search(chunks, embedder):
               f"{len([f for f in fields.values() if f.get('filterable')])} fields")
 
         # --- upsert ------------------------------------------------------
-        written = store.upsert(sample, vectors)
+        written = await store.upsert(sample, vectors)
         stored = stub.index("verify-kb").docs
         check(stage, "documents upserted", written == len(sample)
               and len(stored) == len(sample), f"{len(stored)} documents")
         check(stage, "vectors stored alongside content",
               all(d.get("content_vector") for d in stored.values()))
         check(stage, "count endpoint agrees",
-              store.stats().chunks == len(sample))
+              (await store.stats()).chunks == len(sample))
 
         # --- hybrid + semantic query ------------------------------------
         query = "minimum password length"
-        hits = store.search(query, embedder.embed([query])[0],
+        hits = await store.search(query, (await embedder.embed([query]))[0],
                             SearchFilters(), 5)
         body = (stub.last("/docs/search") or {}).get("body", {})
         check(stage, "hybrid query carries both keyword and vector",
@@ -300,9 +301,9 @@ def stage_5_azure_search(chunks, embedder):
         # Query with terms that match a *different* department, so a broken
         # filter would surface as leaked results rather than as no results.
         leak_probe = "pricing discount seat tier"
-        unscoped = store.search(leak_probe, embedder.embed([leak_probe])[0],
+        unscoped = await store.search(leak_probe, (await embedder.embed([leak_probe]))[0],
                                 SearchFilters(), 10)
-        scoped = store.search(leak_probe, embedder.embed([leak_probe])[0],
+        scoped = await store.search(leak_probe, (await embedder.embed([leak_probe]))[0],
                               SearchFilters(departments=["Sales"]), 10)
         filter_body = (stub.last("/docs/search") or {}).get("body", {})
 
@@ -320,7 +321,7 @@ def stage_5_azure_search(chunks, embedder):
         # --- patch without re-embedding ---------------------------------
         target = sample[0].doc_id
         target_ids = {c.chunk_id for c in sample if c.doc_id == target}
-        patched = store.patch_document_fields(target, {"is_current": False})
+        patched = await store.patch_document_fields(target, {"is_current": False})
         after = stub.index("verify-kb").docs
         check(stage, "metadata patched in place", patched == len(target_ids)
               and all(after[i]["is_current"] is False for i in target_ids),
@@ -331,7 +332,7 @@ def stage_5_azure_search(chunks, embedder):
 
         # --- delete by document -----------------------------------------
         before_count = len(after)
-        removed = store.delete_by_doc(target)
+        removed = await store.delete_by_doc(target)
         remaining = stub.index("verify-kb").docs
         check(stage, "delete removed exactly that document's chunks",
               removed == len(target_ids)
@@ -347,10 +348,10 @@ def stage_5_azure_search(chunks, embedder):
         os.environ["AZURE_SEARCH_ENDPOINT"] = strict.endpoint
         os.environ["AZURE_SEARCH_API_KEY"] = strict.api_key
         degraded = AzureAISearchStore(get_settings(refresh=True))
-        degraded.ensure_index(embedder.dimensions)
-        degraded.upsert(sample[:10], vectors[:10])
+        await degraded.ensure_index(embedder.dimensions)
+        await degraded.upsert(sample[:10], vectors[:10])
         query = "password"
-        results = degraded.search(query, embedder.embed([query])[0],
+        results = await degraded.search(query, (await embedder.embed([query]))[0],
                                   SearchFilters(), 5)
         retried = strict.calls("/docs/search")
         check(stage, "degrades gracefully when semantic ranking is unavailable",
@@ -361,11 +362,11 @@ def stage_5_azure_search(chunks, embedder):
     note(stage, "verified against an offline REST stub (contract test)")
 
 
-def stage_6_to_9(service, question: str, expected_doc: str):
+async def stage_6_to_9(service, question: str, expected_doc: str):
     from rag.generate.guardrails import check_numeric_grounding
 
     started = time.perf_counter()
-    answer = service.ask(question, use_cache=False)
+    answer = await service.ask(question, use_cache=False)
     elapsed = (time.perf_counter() - started) * 1000
     trace = answer.trace
     stages = {s["name"]: s for s in trace.get("stages", [])}
@@ -466,7 +467,7 @@ def stage_6_to_9(service, question: str, expected_doc: str):
 # ===========================================================================
 
 
-def main() -> int:
+async def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--backend", choices=["local", "azure"], default="local",
@@ -512,14 +513,14 @@ def main() -> int:
         changes = stage_1_documents(source)
         parsed = stage_2_parsing(source, changes)
         chunks = stage_3_chunking(source, changes, parsed)
-        embedder = stage_4_embeddings(settings, chunks)
+        embedder = await stage_4_embeddings(settings, chunks)
 
         if args.skip_azure:
             heading(STAGES[4])
             print("  -- skipped (--skip-azure)")
             note(STAGES[4], "skipped")
         else:
-            stage_5_azure_search(chunks, embedder)
+            await stage_5_azure_search(chunks, embedder)
 
         # Build a live index for stages 6-9 through the real sync pipeline.
         if args.backend == "azure":
@@ -533,14 +534,14 @@ def main() -> int:
             os.environ["RETRIEVER_BACKEND"] = "local"
 
         settings = get_settings(refresh=True)
-        backend = get_backend(settings)
-        embedder = get_embedding_provider(settings)
-        report = sync(settings, backend, embedder, source_dir=source)
+        backend = await get_backend(settings)
+        embedder = await get_embedding_provider(settings)
+        report = await sync(settings, backend, embedder, source_dir=source)
         print(f"\n  indexed {report.total_chunks} chunks "
               f"({report.table_chunks} tables) into {backend.name}")
 
-        service = AssistantService(settings)
-        stage_6_to_9(service, args.question, args.expect)
+        service = await AssistantService.create(settings)
+        await stage_6_to_9(service, args.question, args.expect)
 
         if stub is not None:
             stub.stop()
@@ -572,6 +573,10 @@ def main() -> int:
         print("  Stage 5 is a contract test against an offline REST stub, not a\n"
               "  live integration test. See docs/pipeline.md for the live checklist.")
     return 1 if failed else 0
+
+
+def main() -> int:
+    return asyncio.run(_main())
 
 
 if __name__ == "__main__":

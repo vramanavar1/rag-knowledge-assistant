@@ -139,6 +139,14 @@ deliberate rather than accidental:
 | A **token-bucket limiter** in the Function, sized to the deployment's TPM | Turns "we happen not to exceed quota" into "we cannot exceed quota" |
 | A **separate embedding deployment** (or PTU) for ingestion | Physically isolates the two budgets, so ingestion cannot starve serving no matter what |
 
+There is now a third control, inside the process rather than around it. Embedding
+batches are issued concurrently (`asyncio.gather`, measured 7.1× faster than the
+serial loop it replaced) and bounded by an `asyncio.Semaphore` —
+`AZURE_EMBED_CONCURRENCY`, default 8. Concurrency without that bound would not be
+faster, only more efficient at exhausting the quota: `gather` over ~3.6M batches
+would try to issue all of them. The semaphore is the same back-pressure argument
+as the queue, applied one level down.
+
 The second is the one I would insist on before any large backfill: it removes
 the shared-bucket problem entirely rather than managing it.
 
@@ -156,6 +164,17 @@ most common source of accidental quota burn.
 **The API layer is stateless.** All state is in Search, Blob, Cosmos and Redis,
 so instances scale horizontally on concurrency and a bad instance can be
 replaced without draining anything.
+
+**And it is genuinely non-blocking.** Handlers are `async def` over
+`httpx.AsyncClient`, awaited to the transport, so a request spending ~95% of its
+life waiting on Azure holds a coroutine rather than a thread. This is what makes
+"autoscales on concurrency" mean anything: a replica's ceiling is memory, not a
+~40-worker threadpool. It also keeps the readiness probe responsive under load —
+measured at 60 concurrent questions, `/health` p50 is 7.3ms against 780ms on a
+threadpool, and a probe that times out gets a healthy replica killed exactly
+when it is busiest. Work with no network in it (local scoring, hashing, PDF
+parsing) is dispatched with `asyncio.to_thread` rather than merely relabelled
+`async`. See [scale-review.md](scale-review.md#the-async-conversion).
 
 **Managed Identity everywhere, keys nowhere.** The app authenticates to Search,
 OpenAI and Blob with its identity. Key Vault holds the few secrets that remain.
@@ -233,7 +252,17 @@ this one certainly does not.
 
 ## Scale
 
-### 10,000 documents (~1M chunks)
+Chunk counts below are derived from this corpus rather than assumed: ingestion
+measures **11.5 chunks per document** (127 chunks over 11 documents) at ~89
+tokens of embedded text each. That ratio is corpus-dependent — these are short
+policy documents, and a corpus of long reports or manuals would be several
+times denser — so treat it as the low end of a range, not a constant.
+
+[docs/scale-review.md](scale-review.md) works the projection through to 5M
+documents and 1M queries per month, and registers the gaps between what is
+built here and what that scale needs.
+
+### 10,000 documents (~115K chunks)
 
 Essentially the architecture above, sized down.
 
@@ -243,7 +272,7 @@ Essentially the architecture above, sized down.
 - **Cost driver**: query-time Azure OpenAI tokens, not storage.
 - **Ingestion**: a single Function app; a full rebuild takes hours, not days.
 
-### 5–10 million documents (~500M chunks)
+### 5–10 million documents (~60–120M chunks)
 
 The shape holds; four things change materially.
 
@@ -254,8 +283,13 @@ query touches one index, filters are cheap, and a noisy tenant cannot degrade
 another. Add partitions for storage and replicas for QPS independently.
 
 **2. Vector storage becomes the dominant cost, and must be compressed.**
-500M chunks × 1536 dims × 4 bytes is ~3 TB of raw float32. Mitigations, in the
-order I would apply them:
+At the measured ratio, 5M documents is ~58M chunks; × 1536 dims × 4 bytes is
+**~355 GB** of raw float32, and a denser corpus scales that up proportionally.
+Either way the ordering is the point: embedding those chunks is a **one-off
+~$103**, while query-time tokens at 1M questions/month run to **~$9,240 every
+month**. Storage and query-time inference are what cost money; embedding is a
+rounding error, so optimisation effort aimed at it is misdirected. Storage
+mitigations, in the order I would apply them:
 
 - **Scalar/binary quantization** on the vector field (int8 → ~4× reduction,
   binary → ~32× with a rescoring pass). Built into AI Search.

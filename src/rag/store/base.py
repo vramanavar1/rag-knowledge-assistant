@@ -66,6 +66,11 @@ class IndexStats:
     backend: str
     chunks: int = 0
     documents: int = 0
+    # False when `documents` is a lower bound rather than a count. Aggregating
+    # distinct document ids over a large index is expensive and capped, so the
+    # cheap path does not attempt it -- and says so rather than reporting a
+    # number that quietly stops being true past the cap.
+    documents_exact: bool = True
     dimensions: int = 0
     embedding_provider: str = ""
     profile: str = ""
@@ -74,21 +79,34 @@ class IndexStats:
 
 @runtime_checkable
 class SearchBackend(Protocol):
+    """Every operation is ``async``.
+
+    Not because both implementations need it -- the local store is in-memory --
+    but because one of them talks to a remote service over the network, and the
+    protocol has to be shaped for the slower of the two.  A sync protocol would
+    force the Azure backend to block a thread on every call, which is the whole
+    problem this seam exists to avoid.
+
+    An implementation whose work is CPU-bound rather than network-bound is still
+    obliged not to hold the event loop: see ``LocalHybridStore``, which does its
+    scoring in a worker thread.
+    """
+
     name: str
 
-    def ensure_index(self, dimensions: int) -> None:
+    async def ensure_index(self, dimensions: int) -> None:
         """Create or update the index definition. Idempotent."""
 
-    def upsert(self, chunks: list[Chunk], vectors: list[list[float]]) -> int:
+    async def upsert(self, chunks: list[Chunk], vectors: list[list[float]]) -> int:
         """Insert or replace chunks by ``chunk_id``. Idempotent."""
 
-    def delete_by_doc(self, doc_id: str) -> int:
+    async def delete_by_doc(self, doc_id: str) -> int:
         """Remove every chunk belonging to a document. Returns the count."""
 
-    def patch_document_fields(self, doc_id: str, fields: dict[str, Any]) -> int:
+    async def patch_document_fields(self, doc_id: str, fields: dict[str, Any]) -> int:
         """Update denormalised document metadata on a document's chunks."""
 
-    def search(
+    async def search(
         self,
         query: str,
         vector: list[float] | None,
@@ -98,11 +116,19 @@ class SearchBackend(Protocol):
     ) -> list[Hit]:
         """Retrieve candidates. ``filters`` are applied inside the query."""
 
-    def document_ids(self) -> list[str]:
+    async def document_ids(self) -> list[str]:
         ...
 
-    def stats(self) -> IndexStats:
-        ...
+    async def stats(self, *, full: bool = False) -> IndexStats:
+        """Index statistics.
 
-    def save(self) -> None:
+        ``full=False`` (the default) must be cheap enough for a readiness probe
+        polled every few seconds: chunk count only, no aggregation. ``full=True``
+        may run expensive aggregates and is for ingest reporting and startup.
+        """
+
+    async def save(self) -> None:
         """Persist, where the backend is persistent. No-op for remote stores."""
+
+    async def aclose(self) -> None:
+        """Release connection pools. No-op for in-memory stores."""

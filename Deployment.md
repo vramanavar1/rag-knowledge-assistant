@@ -811,6 +811,13 @@ the app runs fully locally and says so.
 | `AZURE_USE_SYSTEM_CERTS` | `false` | Use the OS trust store |
 | `AZURE_TLS_VERIFY` | `true` | `false` disables verification. **Development only** |
 
+### Concurrency
+
+| Variable | Default | Effect |
+|---|---|---|
+| `AZURE_HTTP_MAX_CONNECTIONS` | `200` | Connection pool per provider. One question fans out to up to 3 concurrent searches, so a replica holding N questions wants ~3N. Too low and the pool becomes the bottleneck — and the readiness probe queues behind query traffic |
+| `AZURE_EMBED_CONCURRENCY` | `8` | Embedding batches in flight during ingestion. The back-pressure valve against Azure OpenAI TPM quota; raising it past what the quota allows produces 429s, not throughput |
+
 ### Behaviour
 
 | Variable | Default | Effect |
