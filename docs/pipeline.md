@@ -30,6 +30,11 @@ python scripts/verify_pipeline.py --backend azure  # whole pipeline on the Azure
   9/9 stages verified, 53 checks, 0 failure(s)
 ```
 
+That run had `AZURE_OPENAI_ENABLED=true`. With it unset — the default —
+stage 8 verifies the extractive fallback instead of a live completion, so
+the total is 52 checks and stage 8 reports `generator=extractive`. Both
+are 9/9 passes; the count differs because the assertion differs.
+
 ---
 
 ## Stage by stage

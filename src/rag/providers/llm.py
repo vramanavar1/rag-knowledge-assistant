@@ -203,10 +203,25 @@ class ChatProvider:
 
 def get_chat_provider(settings: Settings) -> ChatProvider:
     provider = ChatProvider(settings)
-    if not provider.available:
+    if provider.available:
+        return provider
+
+    if settings.azure_openai_credentials_present:
+        # The most confusing state to be in, so it gets its own message:
+        # everything needed is present, it is simply not switched on.
+        log.warning(
+            "Azure OpenAI credentials are present but AZURE_OPENAI_ENABLED is "
+            "not set, so they will NOT be used. Answers will be extractive and "
+            "reranking lexical. This is deliberate: credentials are often "
+            "inherited from the machine rather than chosen for this run.",
+            deployment=settings.aoai_chat_deployment,
+            hint="set AZURE_OPENAI_ENABLED=true to use them",
+        )
+    else:
         log.info(
             "no Azure OpenAI chat deployment configured; "
             "answers will be extractive and reranking will be lexical",
-            hint="set AZURE_OPENAI_ENDPOINT / _API_KEY / _CHAT_DEPLOYMENT",
+            hint="set AZURE_OPENAI_ENABLED=true plus "
+                 "AZURE_OPENAI_ENDPOINT / _API_KEY / _CHAT_DEPLOYMENT",
         )
     return provider

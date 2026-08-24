@@ -73,29 +73,62 @@ Three pieces of state, and they behave differently:
 
 ### 2.1 Python
 
-**Python 3.11 or newer.** Verified here on **3.13.7** and **3.14.6**. Nothing
-else is required — no Node, no database, no Azure account for §3 and §4.
+**Pinned to 3.14** — see [`.python-version`](.python-version), which `uv` and
+`pyenv` read automatically. Verified here on **3.14.6** and **3.13.7**; the
+package floor is 3.11 so a reviewer on an older interpreter is not blocked.
+
+**Check which Python you are about to get before you create anything.** On
+Windows these three can easily disagree, and that mismatch is the single most
+common way to break this setup:
 
 ```powershell
-python --version        # expect 3.11+
+py -0p              # every installed interpreter; * marks the launcher default
+python --version    # what PATH resolves - NOT necessarily the same
 ```
 
 ### 2.2 Create a virtual environment
 
-Not strictly required, but do it — it keeps these seven packages out of your
-system Python.
+Pick the interpreter **explicitly**. Do not use a bare `python -m venv`: it
+takes whatever `python` happens to resolve to, which may not be the pinned
+version.
 
 ```powershell
-# PowerShell (Windows)
-python -m venv .venv
+# PowerShell — with uv (honours .python-version automatically)
+uv venv
 .\.venv\Scripts\Activate.ps1
+uv pip install -r requirements.txt
+```
+
+```powershell
+# PowerShell — without uv, naming the version explicitly
+py -3.14 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
 ```bash
 # bash / zsh (macOS, Linux, Git Bash)
-python -m venv .venv
+python3.14 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
 ```
+
+> **If `.venv` already exists, delete it before recreating it.**
+> `python -m venv .venv` over an existing directory rewrites `pyvenv.cfg` and
+> the `Scripts/` shims but **leaves `Lib/site-packages` untouched**. If the new
+> interpreter differs from the one the packages were built for, everything
+> imports fine until it reaches a compiled extension, and then you get
+> `ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'` —
+> because wheels like `pydantic-core`, `lxml` and `PyMuPDF` ship a binary per
+> Python version (`cp314-win_amd64.pyd` vs `cp313-...`).
+>
+> ```powershell
+> Remove-Item -Recurse -Force .venv    # first
+> ```
+
+> Behind a TLS-inspecting corporate proxy, `uv pip install` fails with
+> `invalid peer certificate: UnknownIssuer`. Add `--native-tls` to use the
+> Windows trust store: `uv pip install --native-tls -r requirements.txt`.
 
 > If PowerShell refuses to run the activation script, it is the execution
 > policy, not the repo:
@@ -126,10 +159,14 @@ on `sys.path` on its own.
 ### 2.5 Check the setup before going further
 
 ```powershell
-python -c "import fastapi, uvicorn, pydantic, httpx, dotenv, pymupdf, docx; print('dependencies OK')"
+.\.venv\Scripts\python.exe -V     # expect 3.14.x
+.\.venv\Scripts\python.exe -c "import fastapi, uvicorn, pydantic, httpx, dotenv, pymupdf, docx; print('dependencies OK')"
 ```
 
 If that prints `dependencies OK`, §3 and §4 will work with no further setup.
+Note it runs the venv's interpreter by full path rather than a bare `python` —
+that is the check, not a formality: it confirms the interpreter *and* the
+packages it loads are the pair you just installed.
 
 ### 2.6 Optional, for the Azure paths only (§5, §6)
 
@@ -151,7 +188,7 @@ Complete §2 first, then two commands:
 python scripts/ingest.py
 
 # 2. Serve the API and UI
-uvicorn rag.api.app:app --app-dir src --port 8000
+python -m uvicorn rag.api.app:app --app-dir src --port 8000
 ```
 
 Open <http://localhost:8000>. Both commands are identical on PowerShell and
@@ -233,6 +270,17 @@ Once the API is running, `curl http://localhost:8000/health` should return
 `200` and report `"documents": 11, "chunks": 127`. A **503** there means the
 index is empty — run step 1.
 
+> **"Local" here really is local.** Retrieval, embeddings and generation all
+> run on this machine. Azure OpenAI is only used when you set
+> `AZURE_OPENAI_ENABLED=true` (§5.1) — having credentials in your environment is
+> deliberately *not* enough. If you do have them, startup says so and tells you
+> they are being ignored:
+>
+> ```
+> Azure OpenAI credentials are present but AZURE_OPENAI_ENABLED is not set,
+> so they will NOT be used.  hint=set AZURE_OPENAI_ENABLED=true to use them
+> ```
+
 **What you get with no credentials.** The app runs completely, and says exactly
 what it is running on:
 
@@ -285,8 +333,9 @@ python scripts/verify_pipeline.py
 ```
 
 Walks all nine stages of the assignment's pipeline against a throwaway copy of
-the corpus and asserts each. Expect `9/9 stages verified, 53 checks, 0
-failure(s)`. Exits non-zero on failure, so it can gate CI.
+the corpus and asserts each. Expect `9/9 stages verified, 52 checks, 0
+failure(s)` — 53 when `AZURE_OPENAI_ENABLED=true`, because stage 8 then
+verifies a real completion instead of the extractive fallback. Exits non-zero on failure, so it can gate CI.
 
 **Stage 5 (Azure AI Search) is covered here with no Azure account.** It runs
 against an offline stub of the Search REST API
@@ -393,8 +442,11 @@ cp .env.example .env            # bash
 
 Or set them in the shell directly:
 
+**Set `AZURE_OPENAI_ENABLED=true` as well as the credentials.** Nothing reaches Azure OpenAI without it — that is the point: it makes cloud use an explicit choice rather than a side effect of whatever is in your environment.
+
 ```powershell
 # PowerShell
+$env:AZURE_OPENAI_ENABLED              = "true"
 $env:AZURE_OPENAI_ENDPOINT             = "https://<resource>.openai.azure.com"
 $env:AZURE_OPENAI_API_KEY              = "<key>"
 $env:AZURE_OPENAI_CHAT_DEPLOYMENT      = "gpt-4o"
@@ -403,6 +455,7 @@ $env:AZURE_OPENAI_EMBEDDING_DEPLOYMENT = "text-embedding-3-small"
 ```
 ```bash
 # bash / zsh
+export AZURE_OPENAI_ENABLED=true
 export AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com
 export AZURE_OPENAI_API_KEY=<key>
 export AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-4o
@@ -540,11 +593,12 @@ docker run --rm -p 8000:8000 rag-assistant:latest
 curl -s localhost:8000/health
 ```
 
-Verified behaviour of the baked image — 337 MB, and:
+Verified behaviour of the baked image on the 3.14 base — 342 MB, and:
 
 ```
+container python     -> 3.14.7                       # matches .python-version
 /health              -> 200  {"status":"ready","documents":11,"chunks":127}
-docker exec … id     -> uid=10001(appuser)          # non-root
+docker exec … id     -> uid=10001(appuser)           # non-root
 POST /api/v1/chat    -> answers, extractive with no credentials passed
 POST without a token -> 401                          # API_ALLOW_ANONYMOUS=false
 ```
@@ -558,6 +612,7 @@ cited answers:
 
 ```bash
 docker run --rm -p 8000:8000 \
+  -e AZURE_OPENAI_ENABLED=true \
   -e AZURE_OPENAI_ENDPOINT="$AZURE_OPENAI_ENDPOINT" \
   -e AZURE_OPENAI_API_KEY="$AZURE_OPENAI_API_KEY" \
   -e AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-4o \
@@ -610,7 +665,8 @@ export RETRIEVER_BACKEND=azure
 export AZURE_SEARCH_ENDPOINT=https://<name>.search.windows.net
 export AZURE_SEARCH_API_KEY=$(az search admin-key show \
   --service-name <name> -g $RESOURCE_GROUP --query primaryKey -o tsv)
-export AZURE_OPENAI_ENDPOINT=... AZURE_OPENAI_API_KEY=... \
+export AZURE_OPENAI_ENABLED=true \
+       AZURE_OPENAI_ENDPOINT=... AZURE_OPENAI_API_KEY=... \
        AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-small
 
 python scripts/ingest.py --force
@@ -653,6 +709,7 @@ az containerapp create \
      RAG_PROFILE=improved \
      AZURE_SEARCH_ENDPOINT=https://<name>.search.windows.net \
      AZURE_SEARCH_INDEX=northwind-kb \
+     AZURE_OPENAI_ENABLED=true \
      AZURE_OPENAI_ENDPOINT=https://<aoai>.openai.azure.com \
      AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-4o \
      AZURE_OPENAI_UTILITY_DEPLOYMENT=gpt-4o-mini \
@@ -726,7 +783,8 @@ the app runs fully locally and says so.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `AZURE_OPENAI_ENDPOINT` | — | Resource endpoint. Unset ⇒ extractive answers |
+| **`AZURE_OPENAI_ENABLED`** | **`false`** | **Master switch. Without it the app is fully local no matter what other variables are set** |
+| `AZURE_OPENAI_ENDPOINT` | — | Resource endpoint |
 | `AZURE_OPENAI_API_KEY` | — | API key |
 | `AZURE_OPENAI_API_VERSION` | `2024-10-21` | Data-plane API version |
 | `AZURE_OPENAI_CHAT_DEPLOYMENT` | falls back to `AZURE_OPENAI_DEPLOYMENT_NAME` | Answer synthesis |
@@ -814,6 +872,10 @@ per-department quotas at the gateway.
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| Answers are extractive though credentials are set | `AZURE_OPENAI_ENABLED` is not `true` — by design | Set `AZURE_OPENAI_ENABLED=true`; the startup warning names this exactly |
+| Unexpected Azure OpenAI spend from a "local" run | Inherited `AZURE_OPENAI_*` variables plus `AZURE_OPENAI_ENABLED=true` | Unset the flag; `GET /health` reports `azure_openai_enabled` |
+| `ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'` | The venv's interpreter and its compiled packages are different Python versions — usually `python -m venv` run over an existing venv | Compare `.venv\pyvenv.cfg` with the `cpNNN` tag on `.venv\Lib\site-packages\pydantic_core\*.pyd`; delete `.venv` and rebuild — §2.2 |
+| `uv pip install`: `invalid peer certificate: UnknownIssuer` | TLS-inspecting proxy | `uv pip install --native-tls -r requirements.txt` |
 | `ModuleNotFoundError: No module named 'rag'` | You ran `python -m rag.cli`; the package is under `src/`, which `-m` does not put on `sys.path` | Use `python scripts/cli.py …`, or `pip install -e .` first — §2.4 |
 | `ingest.py` prints `0 new … 11 unchanged` | Nothing is wrong — ingestion is incremental and the corpus has not changed | Check `127 total (22 tables)`. `--force` rebuilds — §3 |
 | `warning: The fitz API is deprecated` | PyMuPDF ≥ 1.28.2 with the old import name | Fixed in this repo; `git pull` if you still see it |

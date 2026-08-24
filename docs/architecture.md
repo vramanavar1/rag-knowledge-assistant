@@ -88,7 +88,70 @@ Applied to both paths rather than sitting on either:
 and parsing is bursty and slow; questions arrive continuously and must be fast.
 A queue between them means a 400-document bulk upload cannot degrade chat
 latency, and a parsing failure cannot take the API down. It also gives natural
-back-pressure against Azure OpenAI embedding quota.
+back-pressure against Azure OpenAI embedding quota — which needs unpacking,
+because it is the failure this design is most specifically guarding against.
+
+### What "back-pressure against embedding quota" means
+
+**The constraint.** An Azure OpenAI deployment is rate-limited per deployment,
+in tokens per minute (TPM) and requests per minute (RPM). Exceed either and the
+service returns `429` with a `Retry-After` header. Quota is a property of the
+deployment, not of the caller — so *every* caller of that deployment draws from
+the same bucket.
+
+**The failure without a queue.** Ingestion embeds every chunk of every changed
+document. Dropping 400 documents in at once is roughly 5,000 embedding calls
+arriving as fast as a loop can issue them. With nothing between the trigger and
+the API, that burst hits the TPM ceiling within seconds; the calls start
+failing, the retries pile onto the same exhausted quota, and the run either
+crawls or dies half-finished.
+
+**The failure that actually hurts.** Query-time embedding usually shares that
+deployment: every question embeds its query text before it can search. So an
+unthrottled bulk ingest does not merely slow itself down — it consumes the TPM
+budget that user questions need, and **people asking questions start getting
+errors because somebody uploaded a folder**. Ingestion starving serving is the
+real risk, and it is invisible until it happens in production.
+
+**What the queue does about it.** A queue-triggered Function pulls a bounded
+number of messages at a time (`batchSize` × `maxConcurrentCalls`). That ceiling
+is the whole mechanism:
+
+- Documents can arrive arbitrarily fast; they land in the queue, which is
+  durable and cheap, instead of in flight against the API.
+- The Function only ever has N documents in progress, so the embedding call rate
+  has a hard upper bound regardless of how large the upload was.
+- When calls do get throttled, `Retry-After` makes each message take longer,
+  the Function finishes messages more slowly, and it therefore *pulls new
+  messages more slowly*. The backlog grows in the queue rather than in retry
+  storms. **That self-regulation is the back-pressure**: the producer is
+  decoupled from the consumer, and the consumer drains at whatever rate the
+  quota actually permits.
+- Queue depth becomes the signal to alert on. A growing backlog says "ingestion
+  is quota-bound", which is diagnosable, rather than "some embeddings failed",
+  which is not.
+
+**Emergent throttling is not enough on its own.** Two additions make it
+deliberate rather than accidental:
+
+| Control | Effect |
+|---|---|
+| A **token-bucket limiter** in the Function, sized to the deployment's TPM | Turns "we happen not to exceed quota" into "we cannot exceed quota" |
+| A **separate embedding deployment** (or PTU) for ingestion | Physically isolates the two budgets, so ingestion cannot starve serving no matter what |
+
+The second is the one I would insist on before any large backfill: it removes
+the shared-bucket problem entirely rather than managing it.
+
+**What this repo does today.** `scripts/ingest.py` is synchronous — there is no
+queue. It batches 16 texts per embedding request
+([`AZURE_BATCH_SIZE`](../src/rag/providers/embeddings.py)) and honours
+`Retry-After` on `429` with exponential backoff
+([`post_with_retry`](../src/rag/providers/http.py)). That is polite, but it is
+not back-pressure: nothing bounds the overall rate, and a large enough corpus
+would still exhaust quota. It does not matter at 11 documents and 127 chunks;
+it would matter immediately at 10,000. The content-hash cache also means a
+re-ingest with no changes issues **zero** embedding calls, which removes the
+most common source of accidental quota burn.
 
 **The API layer is stateless.** All state is in Search, Blob, Cosmos and Redis,
 so instances scale horizontally on concurrency and a bad instance can be

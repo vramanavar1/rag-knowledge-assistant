@@ -6,12 +6,13 @@
 #   docker build -t rag-assistant --build-arg BAKE_INDEX=false .   # Azure-backed
 #   docker run --rm -p 8000:8000 rag-assistant
 #
-# Verified: both variants build; the baked image is 337 MB, runs as uid 10001,
-# serves /health 200 with 11 documents / 127 chunks, answers through the API,
-# and refuses unauthenticated requests with 401. The BAKE_INDEX=false variant
-# builds and correctly reports 503 until a backend is configured.
+# Verified on the 3.14 base: the baked image is 342 MB, reports Python 3.14.7,
+# runs as uid 10001, serves /health 200 with 11 documents / 127 chunks, answers
+# through the API, and refuses unauthenticated requests with 401. The
+# BAKE_INDEX=false variant (verified on the 3.13 base) builds and correctly
+# reports 503 until a backend is configured.
 
-ARG PYTHON_VERSION=3.13
+ARG PYTHON_VERSION=3.14
 
 # ---------------------------------------------------------------------------
 # 1. Dependencies, resolved once into a virtualenv.

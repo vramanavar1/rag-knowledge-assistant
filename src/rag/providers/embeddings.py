@@ -238,7 +238,19 @@ def get_embedding_provider(settings: Settings, *, cached: bool = True) -> Embedd
     """Pick the best available embedder and say so out loud."""
     provider: EmbeddingProvider = LocalEmbedder()
 
-    if settings.aoai_endpoint and settings.aoai_api_key and settings.aoai_embedding_deployment:
+    credentials = bool(settings.aoai_endpoint and settings.aoai_api_key
+                       and settings.aoai_embedding_deployment)
+
+    if credentials and not settings.aoai_enabled:
+        # Same gate as the chat provider: inherited credentials must not turn a
+        # "local" run into a billed cloud one without an explicit opt-in.
+        log.warning(
+            "Azure OpenAI embedding credentials are present but "
+            "AZURE_OPENAI_ENABLED is not set, so the local embedder is used",
+            deployment=settings.aoai_embedding_deployment,
+            hint="set AZURE_OPENAI_ENABLED=true to use them",
+        )
+    elif credentials:
         candidate = AzureOpenAIEmbedder(settings)
         actual = _probe(candidate)
         if actual:

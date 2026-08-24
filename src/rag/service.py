@@ -185,6 +185,11 @@ class AssistantService:
                 "embeddings": self.embedder.name,
                 "llm": self.llm.name,
                 "llm_available": self.llm.available,
+                # Distinguishes "no credentials" from "credentials present but
+                # not switched on", which look identical from the outside.
+                "azure_openai_enabled": self.settings.aoai_enabled,
+                "azure_openai_credentials_present":
+                    self.settings.azure_openai_credentials_present,
             },
             "cache": {"hits": self.cache.hits, "misses": self.cache.misses},
             "detail": None if ready else "index is empty - run scripts/ingest.py",

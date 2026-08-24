@@ -8,6 +8,9 @@ version = "1.0.0"
 description = "RAG knowledge assistant over an enterprise document set, on the Azure AI stack"
 readme = "README.md"
 requires-python = ">=3.11"
+# Development is pinned to 3.14 via .python-version (uv and pyenv read it).
+# Verified on 3.14.6 and 3.13.7. The floor stays at 3.11 so a reviewer on an
+# older interpreter is not blocked from running the repo.
 
 # Mirrors requirements.txt. Azure OpenAI and Azure AI Search are called over
 # their REST APIs with httpx rather than through the azure-* SDKs, which is why

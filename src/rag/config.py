@@ -51,6 +51,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 @dataclass
 class Settings:
     # ---- Azure OpenAI -----------------------------------------------------
+    # Explicit opt-in. Credentials alone are not enough -- see has_azure_openai.
+    aoai_enabled: bool = False
     aoai_endpoint: str = ""
     aoai_api_key: str = ""
     aoai_api_version: str = "2024-10-21"
@@ -101,8 +103,26 @@ class Settings:
         return self.profile == "baseline"
 
     @property
-    def has_azure_openai(self) -> bool:
+    def azure_openai_credentials_present(self) -> bool:
+        """Credentials exist, whether or not they are permitted to be used."""
         return bool(self.aoai_endpoint and self.aoai_api_key and self.aoai_chat_deployment)
+
+    @property
+    def has_azure_openai(self) -> bool:
+        """Azure OpenAI is configured **and** explicitly switched on.
+
+        The flag exists because credentials are frequently inherited rather
+        than chosen: a machine-wide ``AZURE_OPENAI_ENDPOINT`` /
+        ``AZURE_OPENAI_DEPLOYMENT_NAME`` would otherwise make a run described as
+        "local" send document passages to a cloud model, and charge for it,
+        without anyone opting in.
+
+        The search backend already fails closed -- ``RETRIEVER_BACKEND=azure``
+        without credentials falls back to local rather than erroring. This makes
+        Azure OpenAI behave the same way, so "local" means local across
+        retrieval, embeddings and generation alike.
+        """
+        return bool(self.aoai_enabled and self.azure_openai_credentials_present)
 
     @property
     def has_azure_search(self) -> bool:
@@ -128,6 +148,7 @@ class Settings:
 def _load() -> Settings:
     s = Settings()
 
+    s.aoai_enabled = _env_bool("AZURE_OPENAI_ENABLED", False)
     s.aoai_endpoint = _env("AZURE_OPENAI_ENDPOINT").rstrip("/")
     s.aoai_api_key = _env("AZURE_OPENAI_API_KEY")
     s.aoai_api_version = _env("AZURE_OPENAI_API_VERSION", s.aoai_api_version)

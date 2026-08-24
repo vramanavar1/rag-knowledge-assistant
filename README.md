@@ -22,7 +22,7 @@ see [docs/pipeline.md](docs/pipeline.md).</sub>
 Every stage is mapped to its code and re-checked by a runnable verifier:
 
 ```bash
-python scripts/verify_pipeline.py     # 9/9 stages, 53 checks
+python scripts/verify_pipeline.py     # 9/9 stages, 52-53 checks
 ```
 
 | Deliverable | Where |
@@ -39,15 +39,20 @@ python scripts/verify_pipeline.py     # 9/9 stages, 53 checks
 
 ## Quick start
 
-Python 3.11+ and seven packages — `fastapi`, `uvicorn`, `pydantic`, `httpx`,
+Python 3.14 (pinned in `.python-version`; 3.11+ supported) and seven packages — `fastapi`, `uvicorn`, `pydantic`, `httpx`,
 `python-dotenv`, `PyMuPDF`, `python-docx`. No `azure-*` dependency: every Azure
 call goes over REST (see [why](#why-rest-instead-of-the-sdks)).
 
-```bash
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1     # PowerShell   (bash: source .venv/bin/activate)
-pip install -r requirements.txt
+```powershell
+uv venv                            # honours .python-version (3.14)
+.\.venv\Scripts\Activate.ps1      # bash: source .venv/bin/activate
+uv pip install -r requirements.txt
 ```
+
+Without `uv`, name the interpreter explicitly — `py -3.14 -m venv .venv` on
+Windows, `python3.14 -m venv .venv` elsewhere. A bare `python -m venv` picks
+whatever is on `PATH`, which is how you end up with a venv whose interpreter
+and compiled packages disagree.
 
 Full setup, including the Azure paths and production deployment, is in
 **[Deployment.md](Deployment.md)**.
@@ -57,7 +62,7 @@ Full setup, including the Azure paths and production deployment, is in
 python scripts/ingest.py
 
 # 2. Run it
-uvicorn rag.api.app:app --app-dir src --port 8000
+python -m uvicorn rag.api.app:app --app-dir src --port 8000
 #    → http://localhost:8000
 
 # or from the terminal
@@ -65,15 +70,17 @@ python scripts/cli.py ask "What is the nightly hotel cap in London?"
 python scripts/cli.py chat --department Sales
 python scripts/cli.py compare "What was the Professional tier price in 2025?"
 
-# or in a container (337 MB, index baked in, non-root)
+# or in a container (342 MB, Python 3.14, index baked in, non-root)
 docker build -t rag-assistant . && docker run --rm -p 8000:8000 rag-assistant
 ```
 
 Connecting Azure, local testing, and deploying to Azure Container Apps are all
 covered step by step in **[Deployment.md](Deployment.md)**.
 
-Startup logs state exactly which providers are live, so a demo can never
-silently run on a weaker stack than you think:
+Azure OpenAI requires an explicit `AZURE_OPENAI_ENABLED=true`: credentials
+sitting in your environment are deliberately not enough to make a "local" run
+call a cloud model. Startup logs state exactly which providers are live, so a
+demo can never silently run on a weaker — or costlier — stack than you think:
 
 ```
 embedding provider active  provider=local-hashing dimensions=768
@@ -88,6 +95,7 @@ Copy `.env.example` to `.env` and fill in what you have. Everything is optional
 and degrades explicitly.
 
 ```bash
+AZURE_OPENAI_ENABLED=true          # master switch — nothing calls Azure without it
 AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com
 AZURE_OPENAI_API_KEY=<key>
 AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-4o
@@ -191,6 +199,7 @@ eval/       dataset.jsonl  metrics.py  run_eval.py  results/
 Dockerfile  .dockerignore  Deployment.md
 pyproject.toml
 scripts/    cli.py  ingest.py  verify_pipeline.py  verify_lifecycle.py
+            verify_docs.py
             _azure_search_stub.py  provision_azure_search.sh  render_pdf.py
 docs/       pipeline.md  architecture.md  ingestion-flow.md
             failure-scenarios.md  evaluation.md
@@ -601,7 +610,7 @@ python scripts/verify_pipeline.py                  # local backend
 python scripts/verify_pipeline.py --backend azure  # whole pipeline on the Azure adapter
 ```
 
-53 checks across the nine stages, against a throwaway copy of the corpus.
+52-53 checks across the nine stages (53 when `AZURE_OPENAI_ENABLED=true`), against a throwaway copy of the corpus.
 Exits non-zero on failure, so it can gate CI. Full mapping in
 [docs/pipeline.md](docs/pipeline.md).
 
