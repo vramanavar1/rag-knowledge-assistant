@@ -45,6 +45,10 @@ flowchart TB
     API -. "traces" .-> INS
 ```
 
+<sub>The retrieval vocabulary in this diagram — **BM25**, **RRF**, the semantic
+ranker — is kept short here to keep the boxes readable. Each term is spelled out
+and explained in [Why Azure AI Search → In plain terms](#in-plain-terms).</sub>
+
 ### 2 · Ingestion path — what happens when a document arrives
 
 ```mermaid
@@ -137,29 +141,31 @@ deliberate rather than accidental:
 | Control | Effect |
 |---|---|
 | A **token-bucket limiter** in the Function, sized to the deployment's TPM | Turns "we happen not to exceed quota" into "we cannot exceed quota" |
-| A **separate embedding deployment** (or PTU) for ingestion | Physically isolates the two budgets, so ingestion cannot starve serving no matter what |
-
-There is now a third control, inside the process rather than around it. Embedding
-batches are issued concurrently (`asyncio.gather`, measured 7.1× faster than the
-serial loop it replaced) and bounded by an `asyncio.Semaphore` —
-`AZURE_EMBED_CONCURRENCY`, default 8. Concurrency without that bound would not be
-faster, only more efficient at exhausting the quota: `gather` over ~3.6M batches
-would try to issue all of them. The semaphore is the same back-pressure argument
-as the queue, applied one level down.
+| A **separate embedding deployment** (or PTU — Provisioned Throughput Unit, Azure OpenAI's reserved-capacity option) for ingestion | Physically isolates the two budgets, so ingestion cannot starve serving no matter what |
 
 The second is the one I would insist on before any large backfill: it removes
 the shared-bucket problem entirely rather than managing it.
 
-**What this repo does today.** `scripts/ingest.py` is synchronous — there is no
+**What this repo does today.** `scripts/ingest.py` runs in-process — there is no
 queue. It batches 16 texts per embedding request
-([`AZURE_BATCH_SIZE`](../src/rag/providers/embeddings.py)) and honours
-`Retry-After` on `429` with exponential backoff
-([`post_with_retry`](../src/rag/providers/http.py)). That is polite, but it is
-not back-pressure: nothing bounds the overall rate, and a large enough corpus
-would still exhaust quota. It does not matter at 11 documents and 127 chunks;
-it would matter immediately at 10,000. The content-hash cache also means a
-re-ingest with no changes issues **zero** embedding calls, which removes the
-most common source of accidental quota burn.
+([`AZURE_BATCH_SIZE`](../src/rag/providers/embeddings.py)), issues those batches
+concurrently, bounds the fan-out with an `asyncio.Semaphore`
+(`AZURE_EMBED_CONCURRENCY`, default 8), and honours `Retry-After` on `429` with
+exponential backoff ([`post_with_retry`](../src/rag/providers/http.py)).
+
+That semaphore is a third control, inside the process rather than around it, and
+it is the reason the concurrency is safe rather than reckless: `asyncio.gather`
+over ~3.6M batches without a bound would not run faster, it would only exhaust
+the quota more efficiently. Measured, the bounded fan-out is **7.1×** quicker
+than the serial loop it replaced.
+
+What it is *not* is a rate limit. It caps **concurrent requests**, not tokens per
+minute, so a large enough corpus can still saturate a deployment — that is what
+the token-bucket limiter above is for. It does not matter at 11 documents and
+127 chunks; it would matter immediately at 10,000.
+
+The content-hash cache also means a re-ingest with no changes issues **zero**
+embedding calls, which removes the most common source of accidental quota burn.
 
 **The API layer is stateless.** All state is in Search, Blob, Cosmos and Redis,
 so instances scale horizontally on concurrency and a bad instance can be
@@ -202,8 +208,9 @@ Azure estate that does all four in one query:
 
 1. **Hybrid in a single request.** BM25 and vector search run together and are
    fused with RRF server-side. This corpus is full of tokens embeddings blur —
-   `$350`, `99.9%`, `Tier 2`, `FIDO2`, `Net 30`. Losing lexical matching costs
-   real accuracy (see [failure-scenarios.md](failure-scenarios.md#scenario-1)).
+   `$350`, `99.9%`, `Tier 2`, `FIDO2` (Fast IDentity Online 2, an authentication
+   standard), `Net 30`. Losing lexical matching costs real accuracy (see
+   [failure-scenarios.md](failure-scenarios.md#scenario-1)).
 2. **A semantic reranker.** A trained cross-encoder over the fused candidates,
    which is the single biggest precision lever available without writing one.
 3. **Filterable metadata evaluated inside the query.** Security trimming has to
@@ -216,6 +223,24 @@ A pure vector store would need a separate BM25 engine, a separate reranker and
 application-side filter logic — three moving parts to replace one managed
 service, with the security filter moved into code where it is easiest to get
 wrong.
+
+### In plain terms
+
+Those four bullets lean on some vocabulary. In order of appearance:
+
+| Term | Stands for | What it actually means |
+|---|---|---|
+| **BM25** | **B**est **M**atching, formula number 25 — the twenty-fifth in a series its authors tried, first built into the **Okapi** retrieval system at City University, London, which is why it is often written *Okapi BM25* | The classic **keyword** score. It counts how often your search words appear in a passage, weighted so that rare words count for more than common ones, and so that a long passage does not win merely by being long. This is what reliably finds `Net 30` or `$350` — exact tokens that carry the answer but that an embedding blurs into its neighbours. |
+| **Vector search** | Not an acronym. Also called **dense** retrieval, because the vectors are dense lists of numbers rather than mostly-zero word counts | Matching by **meaning** instead of by words. Every chunk is turned into a list of numbers — an *embedding* — that places it in a space where related passages sit near each other; the question is turned into a vector the same way, and the nearest chunks win. It is how *"how much time off do I get"* finds a passage that only ever says *"PTO accrual"* (Paid Time Off), despite the two sharing no word at all. |
+| **RRF**, server-side | **R**eciprocal **R**ank **F**usion | How the two lists above become one. Adding their scores would be meaningless — BM25 scores are unbounded while cosine similarities are not — so RRF ignores the scores and uses each chunk's **position**. A chunk ranked *r* in a list contributes `1 / (60 + r)`, and the contributions are summed; that **reciprocal** is where the name comes from. Ranking well in both lists therefore beats ranking first in only one. *Server-side* means Azure does the fusing inside the same query, so one request returns one already-merged list. |
+| **Cross-encoder** | Not an acronym. Its opposite is a **bi-encoder**, which is what an embedding model is | The kind of model behind the semantic reranker. A bi-encoder reads the question and the passage **separately** and compares the two results — fast, because passages can be encoded once in advance, but lossy. A cross-encoder reads **both together in a single pass**, so it can judge whether this passage answers *this particular question* rather than whether it is broadly on-topic. Far more accurate, and far too slow to run across a whole index — which is precisely why it reranks the top ~20 instead of doing the searching. |
+| **Stemming** | Not an acronym | Cutting words back to a shared root so that their different forms match each other. Without it a question about who **approves** a discount simply does not match a table headed **Approver** — not a hypothetical, but a measured failure in this corpus: the discount-approval table scored zero until stemming was added ([failure-scenarios.md](failure-scenarios.md#scenario-1)). |
+| **Lemmatisation** | Not an acronym — from **lemma**, the head-word under which a dictionary lists all the forms of a word | The careful relative of stemming. Rather than chopping suffixes by rule, it maps a word to its real dictionary form using knowledge of the language: *was* → *be*, *better* → *good*, *policies* → *policy*. Stemming is a blunt instrument that is right most of the time; lemmatisation knows the irregular cases those rules get wrong. |
+
+Azure AI Search provides all six. The local backend has to supply them by hand —
+BM25 and RRF in [`store/local.py`](../src/rag/store/local.py), stemming in
+[`text.py`](../src/rag/text.py) — and has no cross-encoder at all, which is why
+it falls back to an LLM reranker or to lexical scoring.
 
 ---
 
@@ -280,7 +305,8 @@ The shape holds; four things change materially.
 A single index stops being the right unit. Shard by the dimension that also
 matches the security boundary — department, business unit or tenant — so each
 query touches one index, filters are cheap, and a noisy tenant cannot degrade
-another. Add partitions for storage and replicas for QPS independently.
+another. Add partitions for storage and replicas for QPS (queries per second)
+independently.
 
 **2. Vector storage becomes the dominant cost, and must be compressed.**
 At the measured ratio, 5M documents is ~58M chunks; × 1536 dims × 4 bytes is
@@ -297,7 +323,8 @@ mitigations, in the order I would apply them:
   loses little on retrieval quality for this kind of content and cuts storage
   and query cost by 3×.
 - **`stored: false`** on the vector field so the raw vector is not returned.
-- **Two-stage retrieval**: a cheap, compressed ANN pass for recall, then full
+- **Two-stage retrieval**: a cheap, compressed ANN (Approximate Nearest
+  Neighbour) pass for recall, then full
   precision rescoring on the top few hundred.
 
 **3. Ingestion becomes a pipeline product, not a script.**
