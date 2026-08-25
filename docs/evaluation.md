@@ -1,6 +1,15 @@
 # Evaluation — baseline vs improved
 
-Step 4 of the assignment. The generated numbers live in
+The assignment behind this repository — *Senior AI Engineer, Technical Assignment
+Task* — sets five steps: **1** build a RAG knowledge assistant, **2**
+[architecture design](architecture.md), **3**
+[solve common RAG failure scenarios](failure-scenarios.md), **4** **RAG
+evaluation — this document**, and **5**
+[architecture & problem-solving questions](../README.md#step-5--architecture--problem-solving-answers).
+The deliverables table at the top of the [README](../README.md) indexes all five.
+The brief itself is a private document and is not committed here.
+
+The generated numbers live in
 [`eval/results/comparison.md`](../eval/results/comparison.md); this document
 explains how they were produced, what they mean, and what they do *not* mean.
 
@@ -13,6 +22,88 @@ python eval/run_eval.py --compare eval/results/baseline.json \
                                   eval/results/improved.json \
                                   --report eval/results/comparison.md
 ```
+
+---
+
+## What is being compared
+
+`RAG_PROFILE=baseline|improved` selects between two configurations of the **same
+codebase**, run over the same corpus, the same 35-question dataset, the same
+model and the same scoring. A before/after number is only as trustworthy as its
+"before", so this is what the "before" is and how it was built.
+
+### How the baseline is drawn
+
+One rule at every decision point: **do the obvious thing a competent first pass
+does, and omit what a first pass genuinely forgets.**
+
+- Parse with the one-line call each library offers — `page.get_text()`,
+  `doc.paragraphs`.
+- Chunk at a fixed 512 characters. No overlap, no structure.
+- Retrieve the top 5 by vector similarity, once, on the question as typed.
+- Ask for an answer with citations, and stop there.
+
+What it is *not* is handicapped in ways that would make the comparison
+meaningless:
+
+- **Same model, same context size.** `baseline_top_k = 5` and
+  `context_top_k = 5` share one `max_context_chars = 12000` budget, so both
+  profiles put **five chunks in front of the model**. The difference is *which*
+  five, never how many.
+- **It is still asked to cite its sources**, so citation accuracy stays
+  comparable between the two — and the interesting result is that the baseline
+  cites confidently while being wrong, which is the failure users actually
+  report.
+- **It is competent on easy questions**, scoring 80% on straightforward lookups.
+  It falls over exactly where the assignment predicts, not everywhere.
+
+One omission is deliberate rather than accidental: the baseline applies **no
+access control**. Forgetting security trimming is part of what a first pass looks
+like, so the evaluation reports it as a finding instead of quietly correcting it.
+
+The matching argument about *scoring* fairness — the baseline has no abstention
+mechanism, so it must be judged on what it actually said — is in
+[One scoring correction worth stating](#one-scoring-correction-worth-stating).
+
+### What "improved" is, and how it is implemented
+
+Not a second codebase. **One codebase with exactly five branches**, all keyed off
+`Settings.is_baseline` in [`config.py`](../src/rag/config.py):
+
+| # | Where | `baseline` | `improved` |
+|---|---|---|---|
+| 1 | [`ingest/sync.py`](../src/rag/ingest/sync.py) | `chunk_baseline()` over `naive_text`, fixed 512 chars | `chunk_document()` over the parsed block tree |
+| 2 | [`retrieve/pipeline.py`](../src/rag/retrieve/pipeline.py) | `_retrieve_baseline()` — a single top-5 vector search | `_retrieve_improved()` — condense, decompose, hybrid + RRF, rerank, version-rank |
+| 3 | [`generate/answer.py`](../src/rag/generate/answer.py) | ambiguity and sufficiency gates skipped | both gates run |
+| 4 | [`generate/answer.py`](../src/rag/generate/answer.py) | the answer is returned whatever its confidence | withdrawn below `MIN_CONFIDENCE` (0.35) after verification |
+| 5 | [`generate/answer.py`](../src/rag/generate/answer.py) | swaps in [`BASELINE_ANSWER_SYSTEM`](../src/rag/generate/prompts.py) — no refusal token, no rule on quoting figures exactly or on superseded documents | the full answer prompt |
+
+**Parsing is deliberately not one of those branches**, and that is what makes the
+chunking comparison valid. The parser always emits *both* representations — a
+structured block tree and a `naive_text` dump, "what you get from the obvious
+one-liner in each library" — and the profile chooses which to consume. One parse,
+two views, so the measured difference is attributable to the chunking decision
+rather than confounded with a second parse run.
+
+Two more controls: the index and manifest are profile-scoped
+(`index.baseline.json` / `index.improved.json`) so the two can never collide,
+while the embedding cache is deliberately **shared** — the same chunk text under
+the same model yields the same vector either way, which holds the embedding model
+constant across the comparison.
+
+### What that adds up to
+
+| | `baseline` | `improved` |
+|---|---|---|
+| Parsing | `page.get_text()` / `doc.paragraphs` | table-aware, structure-preserving |
+| Chunking | fixed 512 chars, no overlap | section-aware, breadcrumb-prefixed, tables kept whole |
+| Chunks produced | 72 | 127 (22 of them tables) |
+| Retrieval | top-5 pure vector | hybrid BM25 + vector, RRF fused |
+| Ranking | none | LLM rerank over top-20, then version-aware |
+| Query handling | verbatim | condensed, decomposed |
+| Metadata | none used | department, version, effective date, currency |
+| Guardrails | none | sufficiency, ambiguity, groundedness, withdrawal |
+| Access control | none | department pre-filter inside the query |
 
 ---
 
@@ -44,29 +135,6 @@ that matter most for trust — hallucination and abstention — moved furthest.
 The cost is real and stated: answers take about 2.6 s longer and cost about
 twice as much, because reranking, condensation and verification are three extra
 model calls. Both of those are addressed below.
-
----
-
-## What the two profiles are
-
-`RAG_PROFILE` selects between two implementations that share the same code
-path, the same corpus and the same evaluation.
-
-| | `baseline` | `improved` |
-|---|---|---|
-| Parsing | `page.get_text()` / `doc.paragraphs` | table-aware, structure-preserving |
-| Chunking | fixed 512 chars, no overlap | section-aware, breadcrumb-prefixed, tables kept whole |
-| Chunks produced | 72 | 127 (22 of them tables) |
-| Retrieval | top-5 pure vector | hybrid BM25 + vector, RRF fused |
-| Ranking | none | LLM rerank over top-20, then version-aware |
-| Query handling | verbatim | condensed, decomposed |
-| Metadata | none used | department, version, effective date, currency |
-| Guardrails | none | sufficiency, ambiguity, groundedness, withdrawal |
-| Access control | none | department pre-filter inside the query |
-
-The baseline is a genuinely naive implementation, not a strawman — it is what a
-competent first pass looks like, and on straightforward questions it does
-fine (80% correct). It falls over exactly where the assignment predicts.
 
 ---
 

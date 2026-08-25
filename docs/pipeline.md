@@ -65,7 +65,7 @@ That third check is the load-bearing one. Each parser also produces a
 `naive_text` rendering — what the obvious one-liner in each library returns —
 and the verifier asserts the two differ. If someone regressed the parser back
 to `page.get_text()`, this check fails rather than the pipeline quietly losing
-every table. See [failure-scenarios.md](failure-scenarios.md#scenario-1).
+every table. See [failure-scenarios.md](failure-scenarios.md#scenario-1--correct-document-wrong-chunk).
 
 ### 3 · Chunking
 

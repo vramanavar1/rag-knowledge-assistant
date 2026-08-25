@@ -1,7 +1,16 @@
 # Production architecture
 
-The deliverable for Step 2: how this system would be deployed for an enterprise,
-and why each piece is there.
+The assignment behind this repository — *Senior AI Engineer, Technical Assignment
+Task* — sets five steps: **1** build a RAG knowledge assistant, **2** **architecture
+design — this document**, **3**
+[solve common RAG failure scenarios](failure-scenarios.md), **4**
+[RAG evaluation](evaluation.md), and **5**
+[architecture & problem-solving questions](../README.md#step-5--architecture--problem-solving-answers).
+The deliverables table at the top of the [README](../README.md) indexes all five.
+The brief itself is a private document and is not committed here.
+
+This document covers how the system would be deployed for an enterprise, and why
+each piece is there.
 
 ---
 
@@ -210,7 +219,7 @@ Azure estate that does all four in one query:
    fused with RRF server-side. This corpus is full of tokens embeddings blur —
    `$350`, `99.9%`, `Tier 2`, `FIDO2` (Fast IDentity Online 2, an authentication
    standard), `Net 30`. Losing lexical matching costs real accuracy (see
-   [failure-scenarios.md](failure-scenarios.md#scenario-1)).
+   [failure-scenarios.md](failure-scenarios.md#scenario-1--correct-document-wrong-chunk)).
 2. **A semantic reranker.** A trained cross-encoder over the fused candidates,
    which is the single biggest precision lever available without writing one.
 3. **Filterable metadata evaluated inside the query.** Security trimming has to
@@ -232,9 +241,10 @@ Those four bullets lean on some vocabulary. In order of appearance:
 |---|---|---|
 | **BM25** | **B**est **M**atching, formula number 25 — the twenty-fifth in a series its authors tried, first built into the **Okapi** retrieval system at City University, London, which is why it is often written *Okapi BM25* | The classic **keyword** score. It counts how often your search words appear in a passage, weighted so that rare words count for more than common ones, and so that a long passage does not win merely by being long. This is what reliably finds `Net 30` or `$350` — exact tokens that carry the answer but that an embedding blurs into its neighbours. |
 | **Vector search** | Not an acronym. Also called **dense** retrieval, because the vectors are dense lists of numbers rather than mostly-zero word counts | Matching by **meaning** instead of by words. Every chunk is turned into a list of numbers — an *embedding* — that places it in a space where related passages sit near each other; the question is turned into a vector the same way, and the nearest chunks win. It is how *"how much time off do I get"* finds a passage that only ever says *"PTO accrual"* (Paid Time Off), despite the two sharing no word at all. |
+| **Semantic** | Not an acronym | Used two ways, and they are not the same thing. **(1) Semantic search** — in the sense this document's Step-2 question uses, and the sense Azure uses — is keyword retrieval with a semantic ranker on top; the *ranker* is the semantic part. **(2) "Semantic" loosely, meaning "by meaning"** — which is simply vector search, the row above. BM25 is neither: it is the lexical retrieval that sense (1) is built on. Everywhere except that one heading, this document means sense (1) — the ranker. See [Semantic vs vector vs hybrid](#semantic-vs-vector-vs-hybrid). |
 | **RRF**, server-side | **R**eciprocal **R**ank **F**usion | How the two lists above become one. Adding their scores would be meaningless — BM25 scores are unbounded while cosine similarities are not — so RRF ignores the scores and uses each chunk's **position**. A chunk ranked *r* in a list contributes `1 / (60 + r)`, and the contributions are summed; that **reciprocal** is where the name comes from. Ranking well in both lists therefore beats ranking first in only one. *Server-side* means Azure does the fusing inside the same query, so one request returns one already-merged list. |
 | **Cross-encoder** | Not an acronym. Its opposite is a **bi-encoder**, which is what an embedding model is | The kind of model behind the semantic reranker. A bi-encoder reads the question and the passage **separately** and compares the two results — fast, because passages can be encoded once in advance, but lossy. A cross-encoder reads **both together in a single pass**, so it can judge whether this passage answers *this particular question* rather than whether it is broadly on-topic. Far more accurate, and far too slow to run across a whole index — which is precisely why it reranks the top ~20 instead of doing the searching. |
-| **Stemming** | Not an acronym | Cutting words back to a shared root so that their different forms match each other. Without it a question about who **approves** a discount simply does not match a table headed **Approver** — not a hypothetical, but a measured failure in this corpus: the discount-approval table scored zero until stemming was added ([failure-scenarios.md](failure-scenarios.md#scenario-1)). |
+| **Stemming** | Not an acronym | Cutting words back to a shared root so that their different forms match each other. Without it a question about who **approves** a discount simply does not match a table headed **Approver** — not a hypothetical, but a measured failure in this corpus: the discount-approval table scored zero until stemming was added ([failure-scenarios.md](failure-scenarios.md#scenario-1--correct-document-wrong-chunk)). |
 | **Lemmatisation** | Not an acronym — from **lemma**, the head-word under which a dictionary lists all the forms of a word | The careful relative of stemming. Rather than chopping suffixes by rule, it maps a word to its real dictionary form using knowledge of the language: *was* → *be*, *better* → *good*, *policies* → *policy*. Stemming is a blunt instrument that is right most of the time; lemmatisation knows the irregular cases those rules get wrong. |
 
 Azure AI Search provides all six. The local backend has to supply them by hand —
@@ -246,8 +256,38 @@ it falls back to an LLM reranker or to lexical scoring.
 
 ## Semantic vs vector vs hybrid
 
+"Semantic" is the most overloaded word in retrieval, so it is worth pinning
+before comparing anything. **It does not mean BM25, and it does not mean vector
+search.** In the vocabulary this assignment uses — its bonus list names *hybrid
+search* and *semantic ranking / reranking* as two separate items — **semantic is
+the ranker, not the retriever**.
+
+That leaves two independent axes, and the three options are pairings of them:
+
+- **Retrieval** — keyword, vector, or hybrid: `MODE_KEYWORD`, `MODE_VECTOR`,
+  `MODE_HYBRID` in [`store/base.py`](../src/rag/store/base.py).
+- **Ranking** — a layer *on top* of whatever retrieval returned: Azure's semantic
+  ranker (`queryType: semantic`, reported as `rerank_method=azure-semantic`), the
+  LLM reranker, or lexical fallback.
+
+| Option | What it is | In this repo | Where it fails |
+|---|---|---|---|
+| **Semantic search** | BM25 keyword retrieval, with a semantic ranker — a cross-encoder — rescoring the top results | `mode=keyword` + `queryType: semantic` | Anything the keyword pass never retrieved. A ranker can only reorder what retrieval already found, so "how much time off do I get" never surfaces "PTO accrual" and no amount of reranking recovers it. |
+| **Vector search** | Nearest-neighbour over embeddings; no lexical matching at all | `mode=vector` | Exact tokens — `FIDO2`, `Net 30`, `$350` — and near-duplicate variants it blurs together, such as 2-Year against 3-Year prepaid. |
+| **Hybrid + rerank** | BM25 and vector run together, fused by RRF, then reranked | `mode=hybrid` + `queryType: semantic` | Costs one extra model call and some latency. **This is what the system uses.** |
+
+The backend makes the distinction concrete: it attaches the semantic ranker only
+when the mode is keyword or hybrid, **never to a pure vector query**
+([`azure_search.py`](../src/rag/store/azure_search.py)), because the ranker scores
+text rather than vectors. Semantic therefore pairs with lexical retrieval — it is
+not an alternative to it, and it cannot stand in for vector search.
+
 **Use hybrid, then rerank.** That is what this system does, and the reason is
 that the three approaches fail in different, complementary places.
+
+The table below isolates the **retrieval** axis, one variable at a time — no
+reranker on the first two columns — because that is what shows *why* BM25 and
+vector have to be combined rather than chosen between:
 
 | Query | Vector alone | BM25 alone | Hybrid + rerank |
 |---|---|---|---|
@@ -301,12 +341,14 @@ Essentially the architecture above, sized down.
 
 The shape holds; four things change materially.
 
-**1. The index must be partitioned, and probably split.**
-A single index stops being the right unit. Shard by the dimension that also
-matches the security boundary — department, business unit or tenant — so each
-query touches one index, filters are cheap, and a noisy tenant cannot degrade
-another. Add partitions for storage and replicas for QPS (queries per second)
-independently.
+**1. One index stops being the right unit.**
+Shard the corpus across *several* indexes, along the dimension that also matches
+the security boundary — department, business unit or tenant — so each query
+touches one smaller index, filters are cheap, and a noisy tenant cannot degrade
+another. Scaling the search *service* is a separate lever: partitions buy storage
+and indexing throughput, replicas buy QPS (queries per second) and availability,
+and the two are dialled independently. See
+[Details](#details) for how the two are often conflated.
 
 **2. Vector storage becomes the dominant cost, and must be compressed.**
 At the measured ratio, 5M documents is ~58M chunks; × 1536 dims × 4 bytes is
@@ -345,6 +387,196 @@ keep: retrieve document-level candidates first, then chunk-level within them.
 filter, and the ingestion contract. That is deliberate — those are the parts
 that determine answer quality, and they should not be re-litigated at every
 order of magnitude.
+
+### Details
+
+Five mechanisms the discussion above assumes. Each states the rule, the code that
+implements it, and what has been measured — and says plainly where something is
+proposed rather than built.
+
+#### Chunk formation
+
+Chunk boundaries follow **document structure, not character counts**. The
+character limits exist as a safety net for long prose, and on this corpus they
+never fire at all.
+
+**Mechanism.** The parser emits a stream of *typed blocks* — `heading`, `title`,
+`table`, prose — and [`chunk_document()`](../src/rag/ingest/chunker.py) turns
+them into chunks:
+
+| Block | Effect on chunking |
+|---|---|
+| `heading` | Flushes whatever prose is buffered and becomes the new `section_path`. **A section boundary is therefore always a chunk boundary** — no chunk ever straddles two headings. |
+| `table` | Flushes the buffer, then the table is emitted **whole** as its own `content_type="table"` chunk. It is never merged with surrounding prose, and never split unless it exceeds `MAX_TABLE_CHARS` (3,000) — in which case it splits by rows with the header line repeated on every part, so each piece is still readable as a table. |
+| prose | Accumulates until it reaches `MAX_CHARS` (1,400), then `_split_long_text` cuts it on **sentence** boundaries into windows aiming at `TARGET_CHARS` (900), carrying `OVERLAP_CHARS` (150) of the previous window forward — resumed at a word boundary so the overlap reads cleanly. |
+
+Each chunk is then prefixed by `build_embed_text()` with a `Title > Section`
+breadcrumb and a `[department doc_type, effective date, version]` descriptor.
+**That prefixed string is what gets embedded and BM25-indexed** (`embed_text`);
+the bare `text` is what reaches the user and the model. The breadcrumb is the
+difference between a chunk reading `Tier 1 | London | $350` — unanswerable alone,
+since nothing in it says "hotel" — and one that matches "what is the hotel cap in
+London".
+
+Chunk ids are `sha1(doc_id|section_path|ordinal)[:24]`, so a document always
+produces the same ids and re-ingesting is idempotent.
+
+**Measured on this corpus.**
+
+| | |
+|---|---|
+| Chunks / distinct sections | 127 over **107** sections ≈ 1.19 chunks per section |
+| Chunk length | median **232** chars, max **668** |
+| Chunks reaching `MAX_CHARS` | **zero** — the sentence-splitting path never fires here |
+| Largest table chunk | **616** chars — no table was ever split |
+| Breadcrumb cost | ~**110** chars per chunk (mean 247 → 357) |
+
+**Limits.** Chunking here is driven *entirely* by structure; the 900/1,400
+character rules are dormant on short policy documents and would carry real weight
+on a corpus of long reports. The `baseline` profile shows the alternative:
+`chunk_baseline()` takes fixed 512-char windows over the naive text dump, with no
+overlap, section awareness or breadcrumb — and most of the measured quality gap
+between the two profiles originates there.
+
+#### Index sharding, partitions and replicas
+
+These are **two independent levers**, routinely conflated because both are called
+"scaling the index". One is a service setting, the other an application decision.
+
+**Mechanism.**
+
+- **Partitions and replicas belong to the *service*, not to an index.** They are
+  allocated to the Azure AI Search service, and every index on that service
+  shares them. Partitions buy storage and indexing throughput; replicas buy query
+  throughput and availability; billing is partitions × replicas. This repo
+  provisions the smallest of each:
+  `az search service create … --partition-count 1 --replica-count 1`
+  ([`provision_azure_search.sh`](../scripts/provision_azure_search.sh)).
+- **Sharding splits the corpus across *several indexes*** — one per department,
+  business unit or tenant — so any one query touches a smaller index. Nothing in
+  the service configuration expresses this; it is a decision the application
+  makes about where documents live.
+
+**Status.** Exactly one index today, named by `AZURE_SEARCH_INDEX` (default
+`northwind-kb`) and created by `ensure_index()` in
+[`store/azure_search.py`](../src/rag/store/azure_search.py). No application code
+knows partitions exist — they are a provisioning concern — which is why sharding,
+not partitioning, is the lever that would require code to change.
+
+#### Chunk count and vector dimensions
+
+Chunk count and dimensionality are **independent multiplicands** of the same
+product, and neither constrains the other:
+
+```
+vector storage  ≈  chunks  ×  dimensions  ×  4 bytes
+```
+
+**Mechanism.** *Chunks* is how many vectors exist — a property of the corpus and
+of the chunking policy above. *Dimensions* is how wide each vector is — a
+property of the **embedding model**: 1,536 for `text-embedding-3-small`, **768**
+for the local fallback embedder.
+
+**Measured**, holding the corpus fixed and changing only the model:
+
+| | Vectors on disk |
+|---|---|
+| This index — 127 chunks × 768 dims × 4 B | **381 KB** |
+| Same corpus at 1,536 dims | **762 KB** — exactly 2×, purely the dimension change |
+| 5M documents at 1,536 dims (57.7M chunks) | **~355 GB** |
+
+The two knobs pull in opposite directions. Smaller chunks mean *more* vectors:
+better retrieval precision, more storage, more embedding calls. Fewer dimensions
+mean *smaller* vectors: less storage and cheaper queries, at some cost in recall.
+Halving the dimensions and halving the chunk size cancel exactly, which is why
+the projection in [scale-review.md](scale-review.md) tracks both rather than
+either alone.
+
+**Limits.** One hard coupling ties them together at write time.
+`ensure_index(dimensions)` fixes the width of the vector field, and comparing
+vectors of different widths is meaningless, so [`LocalHybridStore.ensure_index`](../src/rag/store/local.py)
+warns and **discards every stored vector** when the dimension changes — keeping
+them would silently yield nonsense similarities. Changing embedding model or
+dimension therefore means re-embedding the entire corpus. At startup the
+embedding probe reports the model's *true* width and overrides the configured
+value, so a misconfigured `AZURE_OPENAI_EMBEDDING_DIMENSIONS` cannot quietly
+build a broken index.
+
+#### Query routing — not implemented
+
+**Status: absent.** Point 4 above is a change proposed *for* the 5–10M tier, not
+a description of what runs today; it is tracked as gap 9 in
+[scale-review.md](scale-review.md).
+
+**What happens instead.** Every question searches **everything the caller is
+permitted to see**. [`Retriever._filters_for()`](../src/rag/retrieve/pipeline.py)
+sets exactly one field on
+`SearchFilters` — `departments` — which narrows by *who is asking*, never by
+*what is asked*. That is security trimming, a different mechanism serving a
+different purpose.
+
+Two adjacent stages resemble routing without being it:
+
+- **[`decompose`](../src/rag/retrieve/decompose.py)** fans *out*, turning one multi-hop question into up to three
+  concurrent searches. It increases the work rather than narrowing it.
+- **[`prefilter_superseded`](../src/rag/retrieve/recency.py)** narrows the
+  candidate set by version, but runs
+  *after* retrieval — too late to save the search cost routing exists to save.
+
+**Available to build on.** `SearchFilters`
+([`store/base.py`](../src/rag/store/base.py)) already carries `doc_ids`,
+`content_types` and `current_only`, and both backends already translate them —
+the local store into an allow-list, the Azure store into OData. The retrieval
+pipeline simply never sets them. A router would slot in between `decompose` and
+`embed`, classify the question into a department, document type or date range,
+and populate those fields, with nothing below it changing. Routing is therefore a
+gap rather than a redesign.
+
+#### The security boundary
+
+Access control is enforced as a **pre-filter evaluated inside the search query**,
+never as a post-filter over results. Every link in the chain sits in the query
+path.
+
+**Mechanism.**
+
+1. The bearer token resolves to a `Principal`
+   ([`api/auth.py`](../src/rag/api/auth.py)) carrying a `departments` list;
+   `["*"]` means unrestricted.
+2. [`Retriever._filters_for(principal)`](../src/rag/retrieve/pipeline.py) turns
+   that into
+   `SearchFilters(departments=[…])`.
+3. The filter is passed **into** `backend.search(...)` and applied *inside* the
+   query by both backends:
+
+| Backend | How the filter is applied |
+|---|---|
+| Local | `allowed = [cid for cid, chunk in … if filters.allows(chunk)]`, computed **before** BM25 and vector scoring run — excluded chunks are never scored at all |
+| Azure AI Search | [`_build_filter()`](../src/rag/store/azure_search.py) emits OData — `search.in(department, 'HR,Finance', ',')` — in the request's `filter` field, evaluated by the service inside the same query |
+
+Post-filtering fails in two ways, the second being the serious one: chunks the
+caller cannot read would consume top-k slots, degrading the answer they *are*
+entitled to; and the shape of the response would leak the existence of documents
+they cannot see. Pre-filtering makes the caller's top 20 genuinely their top 20.
+
+The same boundary applies outside search — `/api/v1/documents` filters through
+[`principal.can_see()`](../src/rag/models.py), so the corpus listing never
+reveals a document the caller
+could not retrieve.
+
+**Measured.** `demo-hr` sees 2 documents; `demo-admin` sees 11.
+
+**Limits.**
+
+- **The `baseline` profile deliberately omits it** —
+  [`_retrieve_baseline`](../src/rag/retrieve/pipeline.py) passes
+  a bare `SearchFilters()`. Forgetting access control is part of what a naive
+  first implementation looks like, and the evaluation reports it as a finding
+  rather than quietly fixing it.
+- The boundary is **department-level**, not per-document or per-user, and the
+  demo bearer tokens are development-only. Production validates Entra ID JWTs and
+  maps group claims onto the same department scopes; the filter mechanism above
+  is unchanged, only the source of `Principal.departments` differs.
 
 ---
 
