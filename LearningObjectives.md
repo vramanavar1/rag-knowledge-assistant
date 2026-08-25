@@ -17,6 +17,8 @@ in the repository — each item linked to its evidence, each marked honestly.
 - [4. Demo + Architecture Presentation Video](#4-demo--architecture-presentation-video)
 - [Summary](#summary)
 - [RAG Failure Scenarios](#rag-failure-scenarios)
+- [Capabilities](#capabilities)
+- [Debugging Process](#debugging-process)
 
 ## Status key
 
@@ -216,8 +218,8 @@ look like success.
 ### Scenario 5 — Ambiguous query
 
 **What fails.** *"What is the limit?"* matches expense category limits, hotel
-rate caps, PTO (Paid Time Off) accrual caps, API (Application Programming
-Interface) call limits, an insurance minimum and a discount cap. The baseline
+rate caps, PTO (Paid Time Off) accrual caps, API call limits, an insurance
+minimum and a discount cap. The baseline
 picks one silently. The answer is not wrong — but the user asked about one thing
 and was told about another, with no signal that a choice was made for them.
 
@@ -283,3 +285,191 @@ than asking the question cold. `key_facts: ['32']` with `forbidden_facts: ['29']
 Full write-ups for all six scenarios — including symptoms, the options
 considered, and the cases that still fail — are in
 [`docs/failure-scenarios.md`](docs/failure-scenarios.md).
+
+---
+
+## Capabilities
+
+| Capability | What it means | Where & how | When it kicks in | Status |
+|---|---|---|---|---|
+| **query rewriting** | Reshape the question before retrieving, so the search runs on something answerable | [`condense.py`](src/rag/retrieve/condense.py) rewrites a follow-up standalone, carrying entities only; [`decompose.py`](src/rag/retrieve/decompose.py) splits multi-hop into ≤3 sub-queries. Both self-skip; both fall back to heuristics | `condense` → `decompose` — the first two stages, before embedding | ✅ |
+| **hybrid search** | Run lexical and vector retrieval together rather than choosing between them | [`local.py`](src/rag/store/local.py): BM25 (Best Matching 25) + cosine, fused by RRF on *ranks* not scores. [`azure_search.py`](src/rag/store/azure_search.py): one request, fused server-side | `search` | ✅ |
+| **semantic ranking / reranking** | Re-order candidates with a model that reads question and passage together | [`rerank.py`](src/rag/retrieve/rerank.py) — three tiers, best available wins: Azure semantic ranker, else an LLM (Large Language Model) reranker over the top 20, else lexical | `rerank`, after `version_filter` | ✅ |
+| **metadata filtering** | Narrow the searchable set by document attributes rather than by text | [`base.py`](src/rag/store/base.py) `SearchFilters` — five fields; an allow-list computed before scoring locally, OData evaluated server-side on Azure ¹ | inside `search` — the filter goes *in* the query, never after it | ⚠️ |
+| **confidence scoring** | Attach a number to an answer, and act on it | [`guardrails.py`](src/rag/generate/guardrails.py) `compute_confidence()` — retrieval strength + top-two margin + citation validity → 0.0–1.0 | after `verify`; below `MIN_CONFIDENCE = 0.35` the answer is withdrawn | ✅ |
+| **guardrails** | Refuse, clarify or withdraw rather than answer badly | [`guardrails.py`](src/rag/generate/guardrails.py) — sufficiency floor, ambiguity gate, refusal token, numeric grounding, citation validation, verification | gates between `version_rank` and `context`; verification at `verify`; then withdrawal | ✅ |
+| **document-level access control** | Restrict what a caller can retrieve, per document | [`auth.py`](src/rag/api/auth.py) token → `Principal.departments`; [`pipeline.py`](src/rag/retrieve/pipeline.py) `_filters_for()` → `SearchFilters`. `/api/v1/documents` filters via `can_see()` ² | built before `search`, applied inside it — so unreadable chunks never take a top-k slot | ⚠️ |
+| **caching** | Avoid paying twice for the same work | [`service.py`](src/rag/service.py) `AnswerCache` — 256 entries, keyed by profile + department scope + question, single-turn only. [`embeddings.py`](src/rag/providers/embeddings.py) `CachedEmbedder` — content-hash, persisted ³ | answer cache **before `condense`**; embedding cache inside `embed`, and inside ingest's `index` | ✅ |
+| **automated RAG evaluation pipeline** | Measure quality repeatably, without hand-grading | [`run_eval.py`](eval/run_eval.py) — run, compare, or re-score saved runs with no new API calls; 35-case dataset; deterministic scoring plus an optional judge ⁴ | offline — never in the request path | ⚠️ |
+| **Application Insights / production observability** | Ship traces and metrics somewhere queryable in production | [`tracing.py`](src/rag/observability/tracing.py) — structured JSON logs, one correlation id per request via `contextvars`, per-stage timings returned in the response ⁵ | correlation id at the middleware, before any stage; `stage()` wraps every stage above | ⚠️ |
+
+¹ **metadata filtering** — the pipeline sets only `departments`; `doc_ids`,
+`exclude_doc_ids`, `current_only` and `content_types` are implemented and never
+set. Version filtering is separate, running *after* retrieval in
+`prefilter_superseded`.
+
+² **access control** — department-level, not per document. `doc_ids` /
+`exclude_doc_ids` exist on `SearchFilters` but are never populated.
+
+³ **caching** — the answer cache is per-replica and in-memory, so its hit rate
+divides by replica count and resets on every deploy — gap 1 of the
+[scale review](docs/scale-review.md#gap-register).
+
+⁴ **evaluation** — no CI (continuous integration) workflow exists, so it runs on
+demand rather than on every change.
+
+⁵ **observability** — `APPLICATIONINSIGHTS_CONNECTION_STRING` is read into
+`Settings` and consumed by nothing: there is no exporter and no OpenTelemetry
+dependency.
+
+**Six present, four partial, none absent.** The partials split into two kinds,
+and the distinction matters for how much work each represents:
+
+- **Mechanisms built but not wired** — metadata filtering and per-document access
+  control. Both are small code changes: the filter fields already exist and both
+  backends already translate them; the pipeline simply never populates them.
+- **Things needing infrastructure, not code** — the evaluation pipeline needs a
+  CI workflow; Application Insights needs an exporter, a dependency and a
+  provisioned resource.
+
+Item 10 is the one worth watching, because **its gap is invisible from
+configuration alone**: the connection string is a documented setting that can be
+set successfully, and nothing downstream reports that it goes nowhere.
+
+---
+
+## Debugging Process
+
+A runbook for one specific production report:
+
+> *"The chatbot gives correct answers most of the time, but occasionally gives a
+> completely wrong answer with a valid-looking citation."*
+
+Written for the stack this repository actually runs on — **Azure OpenAI** for
+generation and **Azure AI Search** for retrieval, both called directly over REST.
+
+### What the symptom already tells you
+
+**"Valid-looking citation" is itself the diagnostic.** It means the citation
+markers resolved to real retrieved sources — `citations_valid: true` with an
+empty `invalid_markers` — so this is *not* a fabricated-reference failure. And
+because an answer was returned rather than withdrawn, it cleared every guardrail
+including the confidence floor.
+
+That narrows it to three causes. They look identical to the user and need
+completely different fixes:
+
+| Cause | What actually happened | How the trace tells them apart |
+|---|---|---|
+| **Wrong chunk of the right document** | The citation is genuine — the retrieved chunk was the wrong row or section of it | Cited hit's `section_path` / `content_type` is not where the answer lives; low `rerank_score`; small `sufficiency.margin` |
+| **Superseded document** | The figure really *is* in that document. It is last year's. | `is_current: false` on a cited hit, an old `effective_date`, `recency_boost`, and the `versioning` block |
+| **Figure absent from the cited source** | Genuine fabrication that slipped past the numeric check | `groundedness.unsupported_figures` non-empty, yet `confidence` still ≥ `MIN_CONFIDENCE` |
+
+The middle one is the most likely and the most dangerous — see
+[Scenario 3](#scenario-3--similar-documents-conflicting-information), where the
+answer is *indistinguishable from a correct one at the point of use*.
+
+### Step 1 — Recover the evidence
+
+Every response carries an `X-Correlation-Id` header, and every log line emitted
+while handling it carries the same `correlation_id`. The response body carries
+the full per-stage trace (`include_trace`, default true) and per-hit scores
+(`include_hits`).
+
+**The constraint, stated plainly.** That trace lives in the response body and the
+log stream and **nowhere else**. `APPLICATIONINSIGHTS_CONNECTION_STRING` is read
+into `Settings` and consumed by nothing — there is no exporter (note ⁵ of
+[Capabilities](#capabilities)). So for a query that has already run:
+
+- if the caller kept the response body, you have everything;
+- if not, you have the log stream, and only for as long as it is retained.
+
+Until an exporter exists, the cheap mitigation is to have the chat client retain
+`X-Correlation-Id` alongside any answer a user reports.
+
+**Then grep the logs for that correlation id.** These lines each change the
+diagnosis:
+
+| Log line | What it means for this bug |
+|---|---|
+| `answer withdrawn after verification` | The guardrail *did* fire — whatever the user saw, it was not this request |
+| `LLM rerank failed, used lexical fallback` | Ranking silently degraded; "wrong chunk" becomes far more likely |
+| `semantic ranking unavailable` | The Azure AI Search semantic ranker is off — it needs Basic tier or above |
+| `Azure OpenAI chat deployment did not respond` | Generation fell back to extractive; the answer was assembled, not written |
+| `… throttled` | 429s from Azure OpenAI; retries changed timing and possibly which path ran |
+
+### Step 2 — Read the trace
+
+| Field | Reads as |
+|---|---|
+| `rerank_method` | `azure-semantic` · `llm` · `lexical` · `lexical-after-degenerate-llm`. Anything but the first two means the reranker never really ran |
+| `sufficiency.margin` | Gap between the top two passages. **Near zero is the tell for this bug** — the ranker had no real winner and picked one anyway |
+| `sufficiency.top_score` | Below `min_relevance` the system should have abstained; if it did not, check which backend produced the score |
+| `groundedness.unsupported_figures` | Non-empty means a figure in the answer is not in any cited source — fabrication |
+| `groundedness.citations_valid` / `invalid_markers` | Expected to be `true` / empty for this symptom; if not, it is a different bug |
+| `versioning` | Whether a superseded twin was filtered before reranking, and whether the demotion inverted for a history question |
+| `security_filter` | Which departments were in scope — a wrong answer can be a correct answer from the wrong scope |
+| `condensed` | Whether the question was rewritten. A bad rewrite retrieves for a question the user never asked |
+| `selected`, `context.dropped` | How many hits reached the prompt, and how many were dropped at the budget |
+
+Per hit, `include_hits` gives `is_current`, `effective_date`, `rerank_score`,
+`keyword_score`, `vector_score`, `rrf_score`, `recency_boost`, `matched_subquery`
+and the chunk text — enough to see exactly which passage the model was reading.
+
+### Step 3 — Reproduce it
+
+Replay it from the command line, substituting the reported question:
+
+```bash
+python scripts/cli.py --show-hits --log-level INFO ask "What does the Professional tier cost per seat?"
+```
+
+- **Turn the answer cache off** — `RAG_ENABLE_ANSWER_CACHE=false`, or
+  `use_cache: false` on the request — otherwise you may be re-reading the same
+  cached answer rather than re-running the pipeline.
+- **Expect near-determinism, not determinism.** `DETERMINISM_SEED` is sent on
+  every temperature-0 call so runs are comparable, but it is a hint: Azure
+  OpenAI's `system_fingerprint` changes when the backend does.
+- **Isolate the layer.** Keyword-only and vector-only retrieval are first-class
+  on the backend (`mode=keyword` / `mode=vector`), which answers "was the right
+  chunk even retrievable?" — note these are **backend arguments, not command-line
+  flags**; calling them takes a few lines against `backend.search(...)`, as
+  [`scripts/verify_pipeline.py`](scripts/verify_pipeline.py) does.
+- **If it does not reproduce**, compare `rerank_method` between runs. The
+  reranker is the usual source of run-to-run variation — a model that scored a
+  passage 10/10 on one call and 0/10 on the next is a failure already seen in
+  this project.
+
+**Then pin it down as a test.** Add the question to
+[`eval/dataset.jsonl`](eval/dataset.jsonl) with `expected_docs`,
+`expected_sections`, `key_facts`, and — the important one for this symptom —
+**`forbidden_facts` naming the wrong value it produced**. Without that negative
+assertion, an answer that hedges by quoting both the right and wrong figures
+still scores as correct. Re-run that category alone to confirm it now fails, then
+fix, then confirm it passes.
+
+### Step 4 — Corrective action, by cause
+
+| Cause | Fix | Then confirm with |
+|---|---|---|
+| **Wrong chunk** | If the fact never made it into a chunk, it is a parsing bug, not a retrieval one — check the chunk text first ([Scenario 1](#scenario-1--correct-document-wrong-chunk)). If it is in the index but ranked below distractors, the reranker is the lever, not a bigger Top-K | `section_hit` and `hit@1` on the affected category |
+| **Superseded document** | Check supersession resolved at ingest, and that `is_current` was actually patched onto the old document's chunks — a demotion that never reached the index looks exactly like this | `versioning` category; the `patch` stage count in the ingest report |
+| **Fabricated figure** | The numeric grounding check should have caught it. Establish whether it ran (`groundedness.method`) and whether confidence stayed above the floor anyway — if so, the floor is too low for this corpus | `hallucination_rate`, and the case you just added |
+
+In every case, finish by re-running **both** profiles and confirming no
+regression elsewhere. If you changed scoring rather than behaviour, use
+`--rescore` so a metric change is never confounded with a generation change.
+
+### Step 5 — What changes on the Azure backends
+
+- **The reranker changes, and so does its scale.** Azure AI Search reports
+  `rerank_method=azure-semantic` and scores 0–4, rescaled ×2.5. `min_relevance =
+  4.0` and the ambiguity gate's `spread < 1.5` were calibrated against the 0–10
+  output of the other reranker, so abstention behaviour must be re-measured —
+  recorded in [`docs/evaluation.md`](docs/evaluation.md#what-these-numbers-do-not-show).
+- **Check `is_current` in the live index.** A superseded document whose flag was
+  never patched will look current to every query, producing precisely this
+  symptom for every question that touches it.
+- **Check for throttling before blaming the pipeline.** Azure OpenAI 429s trigger
+  retries and fallbacks; a wrong answer during a throttling window may be a
+  degraded path rather than a ranking fault.

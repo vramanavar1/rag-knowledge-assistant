@@ -8,8 +8,12 @@ makes the assignment's Step 5 debugging questions answerable with data instead
 of guesswork: for a slow or wrong answer you can see exactly which stage cost
 the time and which chunks each stage passed on.
 
-In production the same spans map onto Application Insights; the exporter is a
-no-op unless APPLICATIONINSIGHTS_CONNECTION_STRING is set.
+These spans are *shaped* for Application Insights -- one correlation id per
+request, one timed span per stage -- but **no exporter is wired up yet**.
+``APPLICATIONINSIGHTS_CONNECTION_STRING`` is read into ``Settings`` and is not
+consumed by anything; sending this data anywhere means adding an exporter
+(OpenTelemetry or the Azure Monitor SDK) and a dependency to match. Until then
+the trace reaches you through the log stream and the response body only.
 """
 
 from __future__ import annotations
