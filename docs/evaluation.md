@@ -1,11 +1,4 @@
 # Evaluation — baseline vs improved
-
-The assignment behind this repository — *Senior AI Engineer, Technical Assignment
-Task* — sets five steps: **1** build a RAG knowledge assistant, **2**
-[architecture design](architecture.md), **3**
-[solve common RAG failure scenarios](failure-scenarios.md), **4** **RAG
-evaluation — this document**, and **5**
-[architecture & problem-solving questions](../README.md#step-5--architecture--problem-solving-answers).
 The deliverables table at the top of the [README](../README.md) indexes all five.
 The brief itself is a private document and is not committed here.
 
@@ -64,6 +57,30 @@ like, so the evaluation reports it as a finding instead of quietly correcting it
 The matching argument about *scoring* fairness — the baseline has no abstention
 mechanism, so it must be judged on what it actually said — is in
 [One scoring correction worth stating](#one-scoring-correction-worth-stating).
+
+#### Thumb-rule for drawing a baseline
+
+Generalising from the above, for any before/after evaluation:
+
+> **If you would not defend it in code review as a reasonable first attempt, it
+> is a strawman, not a baseline.**
+
+That is a judgement call, so here are five checks that make it testable — each
+shown against how this baseline fares:
+
+| # | Check | How this one fares |
+|---|---|---|
+| 1 | **Vary one layer; hold everything else constant.** Same model, corpus, dataset, scoring and context budget. If the baseline gets less context or a weaker model, the comparison measures *that*, not your improvements. | `baseline_top_k = 5`, `context_top_k = 5` and a shared `max_context_chars = 12000` — both profiles put five chunks in front of the same model. |
+| 2 | **It must not lose everywhere.** A control beaten in every single category was rigged, not measured. | It **ties** the improved system in 4 of the 11 categories: `wrong_chunk` 100%/100%, `no_answer` 75%/75%, and both `_control` categories at 100%/100%. |
+| 3 | **Omit only what a first pass genuinely forgets — then publish the omission as a finding**, rather than quietly correcting it. | No access control, so `access_control` scores 0% correct and 100% hallucination. Those numbers are reported, not hidden. |
+| 4 | **Score both systems on what they actually produce**, never on a mechanism only one of them has. | Judging abstention by a `status` field the baseline does not implement overstated its hallucination rate by 9 points — see [One scoring correction worth stating](#one-scoring-correction-worth-stating). |
+| 5 | **Freeze it once measured**, and re-apply any scoring change to *both* runs together. | `python eval/run_eval.py --rescore <results.json>` replays metric changes over saved runs without new API calls, so a metric change can never be confounded with a generation change. |
+
+Check 2 is the one most often skipped, and the easiest to fail without noticing:
+an improvement that wins everywhere usually means the control was crippled
+somewhere it should not have been. Note the honest reading of this run — the
+baseline **ties** in those four categories, it never beats the improved system
+outright.
 
 ### What "improved" is, and how it is implemented
 
