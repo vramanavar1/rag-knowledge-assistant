@@ -429,8 +429,8 @@ query.
 
 The baseline shows the other failure mode, the one you get from *not*
 concatenating: `"What about Starter?"` on its own retrieves badly, and the model
-fills the gap by inventing **$39 per seat** — a price that appears nowhere in
-the corpus.
+fills the gap by inventing **"$49 per seat per month, with a minimum of 10
+seats"** — both figures fabricated. The real values are **$32** and **5**.
 
 ### The fix
 
