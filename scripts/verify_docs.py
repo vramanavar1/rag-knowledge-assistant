@@ -74,6 +74,23 @@ SKIP_REASONS = [
 ]
 
 
+# Lines that are shell *syntax* rather than a command you could run on its own:
+# block delimiters, keywords, and variable assignments. They are not commands, so
+# counting them would overstate how much of the documentation is executable --
+# the opposite of what this script is for. A `$x = az ...` assignment is excluded
+# too: the az call inside it is already covered by the SKIP rules, and the
+# assignment as a whole is not a standalone command.
+_NOT_A_COMMAND = re.compile(
+    r"""^(
+          [}{)\]]                              # a closing or opening block on its own
+        | (if|else|elseif|foreach|for|while|function|param|return|try|catch|finally)\b
+        | \$[\w:]+ \s* =                       # $Var = ... / $env:VAR = ...
+        | \[void\]                             # [void]$errors etc.
+        )""",
+    re.VERBOSE,
+)
+
+
 def extract() -> list[tuple[str, int, str]]:
     """Every command line inside a shell fence, with its source location."""
     found: list[tuple[str, int, str]] = []
@@ -88,9 +105,15 @@ def extract() -> list[tuple[str, int, str]]:
             if lang not in ("bash", "powershell", "sh", "shell"):
                 continue
             cmd = line.strip()
-            # a shell continuation is a fragment, not a command
-            was_continued, continued = continued, cmd.endswith("\\")
+            # A shell continuation is a fragment, not a command. Both characters
+            # are needed: bash continues with a backslash, PowerShell with a
+            # backtick. Miss the backtick and every continued line of an
+            # `az containerapp create` block counts as a command of its own,
+            # which inflates the total this script exists to report honestly.
+            was_continued, continued = continued, cmd.endswith(("\\", "`"))
             if was_continued or not cmd or cmd.startswith(("#", ">")):
+                continue
+            if _NOT_A_COMMAND.match(cmd):
                 continue
             found.append((md.relative_to(REPO_ROOT).as_posix(), lineno,
                           cmd.split("#")[0].strip()))

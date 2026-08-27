@@ -2,9 +2,16 @@
 #
 # Container image for the Northwind Knowledge Assistant API + UI.
 #
-#   docker build -t rag-assistant .                        # self-contained demo image
-#   docker build -t rag-assistant --build-arg BAKE_INDEX=false .   # Azure-backed
-#   docker run --rm -p 8000:8000 rag-assistant
+#   docker build -t rag-assistant:demo --build-arg BAKE_INDEX=true  .   # self-contained
+#   docker build -t rag-assistant:prod --build-arg BAKE_INDEX=false .   # Azure-backed
+#   docker run --rm -p 8000:8000 rag-assistant:demo
+#
+# Distinct tags on purpose: the two variants are not interchangeable, and pushing
+# the wrong one ships a stale baked index to production. Deployment.md §6.1.
+#
+# NOTE: BAKE_INDEX controls only whether the *index* is pre-built. The corpus
+# itself is COPYed into the runtime stage either way, so the documents are in
+# both images. Deployment.md §6.3 covers the alternatives.
 #
 # Verified on the 3.14 base: the baked image is 342 MB, reports Python 3.14.7,
 # runs as uid 10001, serves /health 200 with 11 documents / 127 chunks, answers
@@ -92,7 +99,7 @@ USER appuser
 EXPOSE 8000
 
 # For `docker run`. Azure Container Apps ignores this and uses its own probes —
-# see Deployment.md §6.6 for why /health must be a readiness probe only.
+# see Deployment.md §6.7 for why /health must be a readiness probe only.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "import sys,httpx; sys.exit(0 if httpx.get('http://127.0.0.1:8000/health', timeout=4).status_code == 200 else 1)"
 

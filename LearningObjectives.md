@@ -5,7 +5,7 @@ over a mixed corpus of policy documents, spreadsheets and contracts, built on
 Azure AI Search and Azure OpenAI. It answers questions from retrieved passages,
 cites the source of every claim, trims results to the asker's department, and
 abstains rather than guessing when the corpus cannot support an answer. This
-file tracks the assignment's **Deliverables** section against what is actually
+file tracks the **Deliverables** section against what is actually
 in the repository — each item linked to its evidence, each marked honestly.
 
 ## Contents
@@ -15,10 +15,11 @@ in the repository — each item linked to its evidence, each marked honestly.
 - [2. Architecture Diagram](#2-architecture-diagram)
 - [3. Evaluation Results](#3-evaluation-results)
 - [4. Demo + Architecture Presentation Video](#4-demo--architecture-presentation-video)
+- [5. RAG Failure Scenarios](#5-rag-failure-scenarios)
+- [6. Capabilities](#6-capabilities)
+- [7. Debugging Process](#7-debugging-process)
+- [8. Query Resolution & Evaluation Metrics](#8-query-resolution--evaluation-metrics)
 - [Summary](#summary)
-- [RAG Failure Scenarios](#rag-failure-scenarios)
-- [Capabilities](#capabilities)
-- [Debugging Process](#debugging-process)
 
 ## Status key
 
@@ -88,9 +89,9 @@ rather than composed from scratch.
 | Architecture | 🔲 TO DO | [`docs/architecture.md` § Target architecture](docs/architecture.md#target-architecture) |
 | Azure services selected and why | 🔲 TO DO | [§ Why this architecture](docs/architecture.md#why-this-architecture) and [§ Why Azure AI Search](docs/architecture.md#why-azure-ai-search) |
 | Working chatbot | 🔲 TO DO | [`src/rag/api/static/chat.html`](src/rag/api/static/chat.html); how to start it: [`Deployment.md`](Deployment.md) |
-| One or two RAG failure examples | 🔲 TO DO | **[§ RAG Failure Scenarios](#rag-failure-scenarios) below** — four written up for this purpose. Full set: [`docs/failure-scenarios.md`](docs/failure-scenarios.md), each with a symptom. [Scenario 1](docs/failure-scenarios.md#scenario-1--correct-document-wrong-chunk) is the strongest demo: a table destroyed at parse time |
-| How you diagnosed them | 🔲 TO DO | The **How it was diagnosed** part of each [scenario below](#rag-failure-scenarios); also the *Root cause* and *Evidence* subsections in the full write-ups, plus the diagnostic ladder in [README § Step 5](README.md#step-5--architecture--problem-solving-answers) |
-| Improvements implemented | 🔲 TO DO | The **What was changed** part of each [scenario below](#rag-failure-scenarios); the *The fix* subsection of each full write-up; the five profile branches in [`docs/evaluation.md`](docs/evaluation.md#what-is-being-compared) |
+| One or two RAG failure examples | 🔲 TO DO | **[§ RAG Failure Scenarios](#5-rag-failure-scenarios) below** — four written up for this purpose. Full set: [`docs/failure-scenarios.md`](docs/failure-scenarios.md), each with a symptom. [Scenario 1](docs/failure-scenarios.md#scenario-1--correct-document-wrong-chunk) is the strongest demo: a table destroyed at parse time |
+| How you diagnosed them | 🔲 TO DO | The **How it was diagnosed** part of each [scenario below](#5-rag-failure-scenarios); also the *Root cause* and *Evidence* subsections in the full write-ups, plus the diagnostic ladder in [README § Step 5](README.md#step-5--architecture--problem-solving-answers) |
+| Improvements implemented | 🔲 TO DO | The **What was changed** part of each [scenario below](#5-rag-failure-scenarios); the *The fix* subsection of each full write-up; the five profile branches in [`docs/evaluation.md`](docs/evaluation.md#what-is-being-compared) |
 | Evaluation before vs after | 🔲 TO DO | [`docs/evaluation.md` § Headline](docs/evaluation.md#headline), [`eval/results/comparison.md`](eval/results/comparison.md) |
 | What you would change before production deployment | 🔲 TO DO | [`docs/scale-review.md` § Gap register](docs/scale-review.md#gap-register) — ten ranked gaps; and [`docs/architecture.md` § Scale](docs/architecture.md#scale) |
 
@@ -99,26 +100,7 @@ and technical decisions."*
 
 ---
 
-## Summary
-
-| Deliverable | Status |
-|---|---|
-| 1. GitHub Repository | ✅ Done — 5 of 7 sub-items fully verified, 2 partial |
-| 2. Architecture Diagram | ✅ Done |
-| 3. Evaluation Results | ✅ Done |
-| 4. Demo + Presentation Video | 🔲 TO DO |
-
-**The two partial items are both about live Azure resources, not about code.**
-The Azure AI Search client and the Azure OpenAI embedding client are written and
-exercised — against an offline REST stub and a local fallback embedder
-respectively. Closing them needs a provisioned search service and an embedding
-deployment, then a re-run of ingestion and evaluation; the live checklist is in
-[`docs/pipeline.md`](docs/pipeline.md) and provisioning is scripted in
-[`scripts/provision_azure_search.sh`](scripts/provision_azure_search.sh).
-
----
-
-## RAG Failure Scenarios
+## 5. RAG Failure Scenarios
 
 Four of the six scenarios from
 [`docs/failure-scenarios.md`](docs/failure-scenarios.md), 
@@ -288,7 +270,7 @@ considered, and the cases that still fail — are in
 
 ---
 
-## Capabilities
+## 6. Capabilities
 
 | Capability | What it means | Where & how | When it kicks in | Status |
 |---|---|---|---|---|
@@ -338,7 +320,7 @@ set successfully, and nothing downstream reports that it goes nowhere.
 
 ---
 
-## Debugging Process
+## 7. Debugging Process
 
 A runbook for one specific production report:
 
@@ -379,7 +361,7 @@ the full per-stage trace (`include_trace`, default true) and per-hit scores
 **The constraint, stated plainly.** That trace lives in the response body and the
 log stream and **nowhere else**. `APPLICATIONINSIGHTS_CONNECTION_STRING` is read
 into `Settings` and consumed by nothing — there is no exporter (note ⁵ of
-[Capabilities](#capabilities)). So for a query that has already run:
+[Capabilities](#6-capabilities)). So for a query that has already run:
 
 - if the caller kept the response body, you have everything;
 - if not, you have the log stream, and only for as long as it is retained.
@@ -466,10 +448,255 @@ regression elsewhere. If you changed scoring rather than behaviour, use
   `rerank_method=azure-semantic` and scores 0–4, rescaled ×2.5. `min_relevance =
   4.0` and the ambiguity gate's `spread < 1.5` were calibrated against the 0–10
   output of the other reranker, so abstention behaviour must be re-measured —
-  recorded in [`docs/evaluation.md`](docs/evaluation.md#what-these-numbers-do-not-show).
+  recorded in [`docs/evaluation.md`](docs/evaluation.md#what-these-numbers-do-not-show)
+  and in [§8.6](#86--what-the-built-in-evaluators-cannot-see).
 - **Check `is_current` in the live index.** A superseded document whose flag was
   never patched will look current to every query, producing precisely this
   symptom for every question that touches it.
 - **Check for throttling before blaming the pipeline.** Azure OpenAI 429s trigger
   retries and fallbacks; a wrong answer during a throttling window may be a
   degraded path rather than a ranking fault.
+
+---
+
+## 8. Query Resolution & Evaluation Metrics
+
+Two questions a reviewer asks in a demo, neither of which §5–§7 answers directly:
+**what actually decides** that a question is vague, or that a document is out of
+date, or that the corpus cannot answer at all — and once something goes wrong,
+**which number do I read** to find out why.
+
+### 8.1 — The model decides almost none of this
+
+Four LLM (Large Language Model) calls exist in this pipeline — condense, rerank,
+generate, verify — and **not one of them is ever asked *"is this question
+ambiguous?"* or *"which of these two rate cards is current?"*** Those verdicts are
+reached in Python, from the shape of the retrieved evidence and from metadata
+resolved at ingest. The model's four jobs are narrower than they look:
+
+| Call | What it is asked | What it is **not** asked |
+|---|---|---|
+| `condense` | Rewrite this follow-up as a standalone question | Whether the follow-up needed rewriting — a heuristic decides that, and skips the call |
+| `rerank` | Score *"does this passage answer this question"*, 0–10 | Whether the best score is good enough |
+| `generate` | Write the answer under nine rules | Which sources it may see, or whether to abstain |
+| `verify` | Is each claim stated by a cited source | What to do about it |
+
+The cheapest demonstration is to take the model away. With the Azure OpenAI
+deployment unreachable, every LLM stage falls back to heuristics — and both gates
+still fire correctly, at `llm_calls=0`:
+
+```
+$ python scripts/cli.py ask "What is the limit?"
+[CLARIFY]  ... 3. Expense Categories & Limits — Business Expense Policy (Finance)
+                2. What's Changed for 2026 — OrbitSuite Pricing 2026 (Sales)
+                7. Additional Perks — Employee Benefits Guide (HR) ...
+  llm_calls=0
+
+$ python scripts/cli.py ask "What was the Professional tier price in 2025?"
+[ANSWER]  confidence=0.79   cites Pricing2025.pdf — Professional $59
+  llm_calls=0
+```
+
+The clarification options are still real sections of real documents, and the
+2025 rate card is still the one promoted, because neither decision was the
+model's to make.
+
+That split is deliberate and it has an operational consequence: **a deterministic
+decision is reproducible from the trace; a prompt rule is not.** The one place
+this repo relies on a prompt rule instead of a gate — the invented "Standard
+plan" — is also the one case that still fails intermittently, which is the point
+[`docs/evaluation.md`](docs/evaluation.md#the-one-case-that-still-fails) makes as
+*"a prompt rule is not a deterministic guardrail"*.
+
+### 8.2 — The four hard question types
+
+| Type | Signal actually used | Decided by | The model's role | Caller sees |
+|---|---|---|---|---|
+| **Ambiguous**<br>*"What is the limit?"* | Question shape **first** — ≤4 content terms, contains a generic head (`limit`, `cap`, `deadline`, `rate`, `policy`, `sla`…), ≤1 qualifier. Retrieval scatter **second** — ≥2 departments **or** ≥3 documents in the top 5 | [`detect_ambiguity`](src/rag/generate/guardrails.py) — a cascade of cheap exits; steps 1–3 never touch retrieval at all | **None in the decision.** It only *writes* the clarifying question, from options that are real `section — title (department)` labels, under `CLARIFY_SYSTEM`'s *"do not invent options"* | `needs_clarification` + up to 5 real sections |
+| **Recency**<br>*"What does Professional cost?"* with two rate cards | `is_current` and `effective_date`, resolved corpus-wide at ingest by `reconcile_versions`; plus a year or change-word in the question, via [`detect_temporal_intent`](src/rag/retrieve/recency.py) | [`prefilter_superseded`](src/rag/retrieve/recency.py) **before** reranking, [`apply_version_ranking`](src/rag/retrieve/recency.py) after | Forbidden by answer-prompt **rule 7** from mixing `CURRENT` and `SUPERSEDED` figures. Never asked which is newer | Sources tagged `CURRENT` / `SUPERSEDED` with effective dates |
+| **Not available**<br>*"What is the severance policy?"* | Four gates, cheapest first: rerank top score vs the `min_relevance` floor (**4.0**/10) → the `INSUFFICIENT_EVIDENCE` token → deterministic numeric grounding → claim-by-claim verification; blended by [`compute_confidence`](src/rag/generate/guardrails.py) and **withdrawn** below `MIN_CONFIDENCE` (**0.35**) | [`assess_sufficiency`](src/rag/generate/guardrails.py), [`check_numeric_grounding`](src/rag/generate/guardrails.py), [`verify_groundedness`](src/rag/generate/guardrails.py) | Emits `INSUFFICIENT_EVIDENCE` **verbatim** (rule 4) so abstention is machine-checkable, applies the entity-definition check (rule 6), and acts as the claim verifier | `insufficient_evidence` |
+| **Conflicting** | Two distinct cases — see the table below | — | — | — |
+
+Three things in that table are easy to read past, and each is the whole point:
+
+- **Ambiguity is checked *after* retrieval and *after* condensation.** Retrieve,
+  then ask — so every option offered is a section that exists, rather than a guess
+  at what the user might have meant. And a follow-up that conversation history
+  already resolves never reaches the check: *"what is the limit?"* after a
+  question about expenses has already been rewritten into something specific.
+- **Recency is the one type where similarity is structurally incapable of
+  helping.** It is not a property of the text. No embedding, no reranker and no
+  amount of `top_k` (the number of passages retrieved) recovers it — it has to
+  arrive as metadata, reconciled corpus-wide, because whether the 2026 card is
+  current depends on whether a 2027 one exists.
+- **"Did retrieval return anything?" is not a test of whether an answer
+  exists.** `top_k` is a fixed number, so a question about a policy that is not in
+  the corpus still returns five confident-looking chunks about adjacent topics.
+  The relevance floor tests the *scores*, not the row count.
+
+**"Conflicting data" is two different problems, and only one is solved:**
+
+| Case | Example | Status |
+|---|---|---|
+| **Version conflict** — one fact, two vintages | `Pricing2025.pdf` vs `Pricing2026.pdf` | ✅ Supersession metadata, superseded chunks filtered **before** reranking, prompt rule 7 forbidding mixed figures |
+| **Genuine contradiction** — two **current** documents that disagree | Two live policies stating different notice periods | 🔲 **Not handled.** There is no conflict detector. Rule 5 (answer the part that is covered, say which part is not) is the nearest thing and it is not the same mechanism — the model would more likely pick one silently |
+
+That second row is a real gap, stated here rather than omitted — the same
+convention as the access-control omission reported in
+[`docs/evaluation.md`](docs/evaluation.md#how-the-baseline-is-drawn).
+
+### 8.3 — Where each decision lands in the trace
+
+The stage sequence, with the three gates marked. This is what ties §8 back to the
+§7 runbook — every verdict above is greppable in a response body:
+
+```
+condense → decompose → embed → search → version_filter → rerank → version_rank
+                                             │                         │
+                                             └── recency ──────────────┘
+       → context → generate → verify
+            │          │
+            └──────────┴── ambiguity + sufficiency (both run at the start of
+                           generation, because both decide from the retrieved
+                           evidence rather than from the question text alone)
+```
+
+| Field | Where | Carries |
+|---|---|---|
+| `standalone_query` | response body | The question retrieval actually ran on, after condensation |
+| `subqueries` | response body | How a multi-part question was split; each hit also carries `matched_subquery`, so you can see which half of a comparison it supports |
+| `confidence` | response body | The blend of retrieval strength, margin, groundedness and citation validity |
+| `condensed` | `trace` | Whether condensation rewrote the question at all, or self-skipped |
+| `security_filter` | `trace` | The departments the caller was allowed to search |
+| `rerank_method` | `trace` | `azure-semantic`, the LLM reranker, or the lexical fallback — i.e. **which scale the scores are on** |
+| `versioning` | `trace` | `explicit_year`, `wants_history`, `dropped_superseded`, `boosted`, `demoted` |
+| `selected` | `trace` | How many chunks actually reached the context window |
+
+Per-stage timings and their own fields sit alongside — `decompose.subqueries` as
+a count, `version_filter.*`, `rerank.method`, `version_rank.*`. The whole trace is
+on by default (`include_trace`) and, as [§7](#7-debugging-process) records, it
+lives in the response body and the log stream and **nowhere else**.
+
+### 8.4 — Azure RAG evaluation metrics, side by side
+
+Azure AI Foundry's built-in RAG (Retrieval-Augmented Generation) evaluators, with
+the plain-language reading of each next to it. The rightmost column is the one
+that matters for adoption here: **the same questions are already being asked by
+`eval/metrics.py` under different names**, so these are additive, not a rewrite.
+
+| Azure evaluator | In plain words | Score | A low score means | First thing to change | Closest metric here |
+|---|---|---|---|---|---|
+| `builtin.retrieval` | *Did the search put the useful passages near the top?* | 1–5, LLM-judged on query + context | The right passages are in the candidate set but badly ordered — **or** the chunk is unreadable on its own | Chunking (heading breadcrumbs), hybrid + RRF (Reciprocal Rank Fusion), the rerank window | `hit@1`, `mrr` (Mean Reciprocal Rank), `section_hit` |
+| `builtin.document_retrieval` | *A search-quality scorecard graded against labelled relevance judgments* | `ndcg@3` (Normalised Discounted Cumulative Gain), `xdcg@3`, `fidelity`, `top1_relevance`, `top3_max_relevance`, `holes`, `holes_ratio` | **`fidelity` low → a recall problem** — the good documents never entered the result set at all. **`ndcg@3` low while `fidelity` is fine → a ranking problem.** **`holes_ratio` high → your *labels* are incomplete, not your search** | Recall: parsing and ingestion. Ranking: rerank. Holes: label more documents before touching anything | `doc_recall`, `hit@5`, the `expected_docs` fixtures in [`eval/dataset.jsonl`](eval/dataset.jsonl) |
+| `builtin.groundedness` | *Did it stick to the sources it was given?* | 1–5 | Hallucination — the answer went beyond the context | Answer-prompt rules 1–3, the `MIN_CONFIDENCE` withdrawal | `groundedness` — numeric check plus claim verifier |
+| `builtin.groundedness_pro` | *A second opinion that tells you **which** claim was unsupported* | pass/fail + a `reason` string | Same as above — but the `reason` string is the actual triage tool. Read it before changing anything | — | `unsupported_figures`, `unsupported_claims` |
+| `builtin.relevance` | *Did it answer the question that was actually asked?* | 1–5, query + response only — **no context** | It answered a **different** question. This is the classic ambiguity symptom | Condensation, decomposition, the ambiguity gate | `judge_score` |
+| `builtin.response_completeness` | *Did it answer **all** of it?* | 1–5, needs ground truth | Half a multi-part question was silently dropped | Sub-query decomposition, round-robin context selection, `max_context_chars` | `key_facts_missing` |
+
+The split worth internalising is Azure's own: `document_retrieval` is a
+**component** evaluation — it grades the search engine against relevance labels
+and never sees the answer — while `groundedness` / `relevance` /
+`response_completeness` are **system** evaluations that grade the final response.
+A retrieval failure and a generation failure need different fixes, so averaging
+them hides which one you have. That is the same reason this repo scores retrieval
+and generation separately.
+
+### 8.5 — The triage grid
+
+Read three numbers, get one diagnosis. This is the section to use in an incident;
+the rest is background.
+
+| `retrieval` | `groundedness` | `relevance` | Diagnosis | Where to look |
+|:---:|:---:|:---:|---|---|
+| high | **low** | – | The model is inventing **despite** good context | Answer prompt; the `MIN_CONFIDENCE` (0.35) withdrawal threshold |
+| **low** | high | – | It answered faithfully — from the **wrong passage** | Parsing → chunking → hybrid → rerank, **in that order** |
+| high | high | **low** | It answered a different question than the one asked | [`condense.py`](src/rag/retrieve/condense.py), [`decompose.py`](src/rag/retrieve/decompose.py), the ambiguity gate |
+| **low** | **low** | **low** | The corpus probably does not contain it. **Check whether abstaining is the correct behaviour before "fixing" anything** | `min_relevance` (4.0), and the case's `expected_status` |
+| high | high | high | …and the user still says it is wrong → **version conflict.** No built-in metric can see this | `is_current` and `effective_date` in the live index |
+
+**Row 2 is the most useful line in this section**, and the order in it is not
+cosmetic. It generalises Scenario 1: the London hotel rate cap was missing
+because `page.get_text()` destroyed the table at parse time — not because
+`top_k` was too small. Every hour spent tuning retrieval before checking that the
+fact survived parsing is an hour wasted. **Grep the chunk text for the fact
+first.**
+
+### 8.6 — What the built-in evaluators cannot see
+
+Five blind spots, each already evidenced somewhere in this repository. A metric
+that scores a wrong answer 5/5 is worse than no metric, so these matter more than
+the table above.
+
+1. **Recency is invisible to every built-in evaluator.** An answer citing the
+   superseded 2025 rate card scores `groundedness` 5/5, `relevance` 5/5 and
+   `retrieval` 5/5 — it is faithful, relevant and well-retrieved, and it is
+   wrong. Only ground truth catches it, which is exactly why every versioning case
+   in [`eval/dataset.jsonl`](eval/dataset.jsonl) carries
+   `forbidden_facts: ['59']` alongside `key_facts: ['65']`. **Without that
+   negative check, an answer that hedges by quoting both prices scores as
+   correct.**
+2. **Correct abstention is *penalised*.** `INSUFFICIENT_EVIDENCE` scores about 1
+   on relevance and completeness against any ground truth, so a system that
+   abstains honestly looks worse than one that guesses fluently. Score abstention
+   cases separately — as `abstention_accuracy` does here, measured **only** on the
+   cases whose `expected_status` is not `answered`.
+3. **Correct clarification is penalised the same way** — and optimising toward the
+   metric produces a system that clarifies everything, which is worse than one
+   that never clarifies. The fix is a control case that **must not** fire:
+   `ambiguous_control`, *"What is the expense limit for client gifts?"*, exists
+   purely to measure the gate **not** firing. See
+   [§5 Scenario 5](#scenario-5--ambiguous-query).
+4. **The evaluators are LLM-judged, and LLM judges drift.** `temperature=0` is not
+   determinism; a `seed` is a hint, not a guarantee. During development this
+   repo's own reranker scored every candidate 0/10 on one call and scored the
+   right one 10/10 on the next, with identical input — which is why a degenerate
+   all-zero rerank now falls back to the deterministic lexical scorer. **Treat a
+   single evaluator run as a sample, not a measurement.**
+5. **Thresholds do not transfer between rankers.** `min_relevance = 4.0` and the
+   ambiguity gate's `spread < 1.5` were calibrated against a 0–10 LLM reranker.
+   Azure AI Search's semantic ranker emits 0–4, rescaled ×2.5 —
+   **rescaling a *range* is not the same as matching a *distribution*.** Both
+   thresholds would then apply to a scorer they were never calibrated against, so
+   abstention and clarification rates must be **re-measured** after any backend
+   switch; which direction they move is not predictable from the current run.
+   Also in [`docs/evaluation.md`](docs/evaluation.md#what-these-numbers-do-not-show)
+   and [§7 Step 5](#step-5--what-changes-on-the-azure-backends).
+
+### 8.7 — Status
+
+🔲 **Not integrated.** There is no `azure-ai-evaluation` dependency and no
+Foundry evaluation run — this section maps the Azure evaluator set onto the
+metrics [`eval/metrics.py`](eval/metrics.py) already produces, so the two can be
+reconciled if a Foundry project is provisioned. Closing it means adding the
+package, exporting `eval/results/*.json` into the evaluator input schema, and
+re-running; the existing `--rescore` flag exists precisely so a scoring change is
+never confounded with a generation change.
+
+What **is** available today without any Azure resource: the reranker's score
+reaches the trace as `rerank_score` on every hit, `rerank_method` records which
+of the three rerankers produced it, and `confidence` on every response is the
+blend of retrieval strength, margin, groundedness and citation validity computed
+by [`compute_confidence`](src/rag/generate/guardrails.py).
+
+---
+
+## Summary
+
+| Deliverable | Status |
+|---|---|
+| 1. GitHub Repository | ✅ Done — 5 of 7 sub-items fully verified, 2 partial |
+| 2. Architecture Diagram | ✅ Done |
+| 3. Evaluation Results | ✅ Done |
+| 4. Demo + Presentation Video | 🔲 TO DO |
+
+Sections 5–8 are supporting analysis rather than items the brief asked for — the failure write-ups, the bonus-capability audit, the debugging runbook and the query-resolution/metrics map. The brief lists four deliverables, which is why this table has four rows.
+
+**The two partial items are both about live Azure resources, not about code.**
+The Azure AI Search client and the Azure OpenAI embedding client are written and
+exercised — against an offline REST stub and a local fallback embedder
+respectively. Closing them needs a provisioned search service and an embedding
+deployment, then a re-run of ingestion and evaluation; the live checklist is in
+[`docs/pipeline.md`](docs/pipeline.md) and provisioning is scripted in
+[`scripts/provision_azure_search.sh`](scripts/provision_azure_search.sh).
+
+---
