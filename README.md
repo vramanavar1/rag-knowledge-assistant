@@ -22,7 +22,7 @@ see [docs/pipeline.md](docs/pipeline.md).</sub>
 Every stage is mapped to its code and re-checked by a runnable verifier:
 
 ```bash
-python scripts/verify_pipeline.py     # 9/9 stages, 52-53 checks
+python scripts/verify_pipeline.py     # 9/9 stages, 53-54 checks
 ```
 
 | Deliverable | Where |
@@ -612,7 +612,7 @@ python scripts/verify_pipeline.py                  # local backend
 python scripts/verify_pipeline.py --backend azure  # whole pipeline on the Azure adapter
 ```
 
-52-53 checks across the nine stages (53 when `AZURE_OPENAI_ENABLED=true`), against a throwaway copy of the corpus.
+53-54 checks across the nine stages (54 when `AZURE_OPENAI_ENABLED=true`), against a throwaway copy of the corpus.
 Exits non-zero on failure, so it can gate CI. Full mapping in
 [docs/pipeline.md](docs/pipeline.md).
 

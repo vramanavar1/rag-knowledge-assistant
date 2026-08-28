@@ -233,7 +233,7 @@ Correlation ids round-trip through header, body and trace; all 10 pipeline
 stages are still recorded in order, with no interleaving — the sub-query
 fan-out deliberately opens no `stage()` inside its tasks. Security trimming
 still holds (`demo-hr` sees 2 documents, `demo-admin` 11). `verify_pipeline`
-9/9 and 52 checks, `verify_lifecycle` 23/23, `verify_docs` 0 failed, and the
+9/9 and 53 checks, `verify_lifecycle` 23/23, `verify_docs` 0 failed, and the
 multi-hop evaluation is unchanged at 25% correct / hit@5 1.0.
 
 ---

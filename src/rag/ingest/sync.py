@@ -8,14 +8,24 @@ of operations matters and is not obvious, so it is spelled out here:
 3. Reconcile versions across the *whole* corpus -- fresh metadata for what was
    parsed, manifest metadata for everything else.  This happens BEFORE chunking
    so that new chunks are written with a correct ``is_current`` from the start.
-4. Purge: deleted documents lose all their chunks; modified documents lose
+4. Ensure the index exists.  Before the purge, because purging *reads* the index.
+5. Purge: deleted documents lose all their chunks; modified documents lose
    their previous chunks before the new ones are written.
-5. Chunk, embed (cache-checked) and upsert the new and modified documents.
-6. Patch the documents whose currency changed without their bytes changing --
+6. Chunk, embed (cache-checked) and upsert the new and modified documents.
+7. Patch the documents whose currency changed without their bytes changing --
    adding Pricing2027.pdf demotes Pricing2026.pdf, which was never re-parsed.
-7. Persist manifest, embedding cache and index.
+8. Persist manifest, embedding cache and index.
 
-Step 6 is the one a naive implementation omits, and its absence is silent: the
+Two of these orderings are load-bearing and were each got wrong once:
+
+Step 4 before step 5.  ``delete_by_doc`` searches the index to find the chunk
+ids to remove, and on Azure AI Search searching an index that does not exist is
+a 404.  With the two reversed, a first run against a fresh service died before
+it could create the index it was about to fill -- and only when the manifest
+already listed the documents, which ``--force`` guarantees and which is what you
+get pointing an existing local manifest at a new Azure index.
+
+Step 7 is the one a naive implementation omits, and its absence is silent: the
 index keeps serving a superseded document as current until someone happens to
 re-ingest the file that was replaced.
 """
@@ -178,7 +188,24 @@ async def sync(
             elif not metas[doc_id].is_current:
                 report.superseded_now.append(doc_id)
 
-    # ---- 4. purge -----------------------------------------------------
+    # ---- 4. ensure the index exists ------------------------------------
+    #
+    # This has to happen BEFORE the purge, not after it.  `delete_by_doc`
+    # searches the index to find the chunk ids to remove, and on Azure AI Search
+    # a search against an index that does not exist is a 404, which the store
+    # turns into a RuntimeError.  A first run against a fresh service has
+    # nothing to purge but must still be able to *ask* -- and it asks whenever
+    # the manifest says a document was already ingested, which is exactly what
+    # `--force` guarantees and what pointing an existing local manifest at a new
+    # Azure index produces.  Getting this backwards means ingestion dies before
+    # it can create the index it is about to fill.
+    #
+    # PUT is create-or-update, so running it first stays idempotent.
+    await backend.ensure_index(embedder.dimensions)
+    if hasattr(backend, "set_embedding_provider"):
+        backend.set_embedding_provider(embedder.name)
+
+    # ---- 5. purge -----------------------------------------------------
     with stage("purge") as st:
         purged = 0
         for doc_id in changes.deleted:
@@ -190,11 +217,7 @@ async def sync(
         report.chunks_purged = purged
         st["chunks"] = purged
 
-    # ---- 5. chunk, embed, upsert --------------------------------------
-    await backend.ensure_index(embedder.dimensions)
-    if hasattr(backend, "set_embedding_provider"):
-        backend.set_embedding_provider(embedder.name)
-
+    # ---- 6. chunk, embed, upsert --------------------------------------
     with stage("index") as st:
         written = 0
         for doc_id in changes.touched:
@@ -235,7 +258,7 @@ async def sync(
         report.chunks_written = written
         st["chunks"] = written
 
-    # ---- 6. patch documents whose currency changed without a re-parse --
+    # ---- 7. patch documents whose currency changed without a re-parse --
     with stage("patch") as st:
         patched = 0
         for doc_id in changed_ids:
@@ -259,7 +282,7 @@ async def sync(
         if doc_id in metas:
             manifest.update_meta(doc_id, metas[doc_id])
 
-    # ---- 7. persist ---------------------------------------------------
+    # ---- 8. persist ---------------------------------------------------
     with stage("persist"):
         await asyncio.to_thread(manifest.save)
         if hasattr(embedder, "save"):

@@ -327,9 +327,22 @@ async def get_embedding_provider(
                 candidate.dimensions = actual
             provider = candidate
     else:
+        # Name the settings that are actually absent rather than guessing at one.
+        # The expensive case is *partial* configuration -- endpoint and deployment
+        # set but no key, say -- where a fixed "no embedding deployment
+        # configured" message points at the one setting that is already correct.
+        # That fallback is silent and its symptom is remote: the app embeds at
+        # 768 while the index expects the model's width, and every query then
+        # fails deep inside the search backend on a vector-dimension mismatch.
+        missing = [name for name, value in (
+            ("AZURE_OPENAI_ENDPOINT", settings.aoai_endpoint),
+            ("AZURE_OPENAI_API_KEY", settings.aoai_api_key),
+            ("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", settings.aoai_embedding_deployment),
+        ) if not value]
         log.info(
-            "no embedding deployment configured, using local embedder",
-            hint="set AZURE_OPENAI_EMBEDDING_DEPLOYMENT to enable Azure embeddings",
+            "falling back to the local embedder",
+            missing=",".join(missing),
+            hint=f"set {' and '.join(missing)} to use Azure embeddings",
         )
 
     log.info("embedding provider active", provider=provider.name,

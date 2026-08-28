@@ -188,6 +188,35 @@ packages it loads are the pair you just installed.
 - Azure AI Search, Basic SKU or above if you want the semantic ranker.
 - Docker, for §6.
 
+#### What permissions you need
+
+**Two different identities are involved, and they need different things.**
+Confusing them is the usual reason a deploy stalls:
+
+| Identity | Needs | Where it bites |
+|---|---|---|
+| **You** — the account `az login` used | `Contributor` on the resource group to create resources, **plus `Owner` or `User Access Administrator`** to run `az role assignment create` | **`Contributor` cannot create role assignments.** Creating a resource and granting access to it are separate privileges, and §6.5 needs both |
+| **The container app's managed identity** | `AcrPull` on the registry | Without it the deploy reports `No credential was provided to access Azure Container Registry`. That message is about *the app*, not about you |
+
+Check what you have before starting §6:
+
+```powershell
+az account show --query "{subscription:name, user:user.name}" -o table
+
+az role assignment list --assignee (az account show --query user.name -o tsv) `
+    --all --include-groups --include-inherited -o table
+```
+
+**Both flags on the second command matter.** A role can be inherited from a
+management group or granted through a group you belong to; without
+`--include-groups --include-inherited` the listing can come back empty while you
+are in fact an Owner.
+
+If you have `Contributor` but not `Owner` / `User Access Administrator`,
+everything in §6 works except the one `az role assignment create` line — see
+§6.5 for how to hand that single command to someone who can run it, and §6.6 for
+the fallback that needs no role assignment at all.
+
 ---
 
 ## 3. Path A — local, zero-install
@@ -335,14 +364,14 @@ pipeline side by side — the quickest way to see a failure scenario and its fix
 Local testing is fully supported and needs no Azure account. Four suites, in
 increasing cost.
 
-### 4.1 Pipeline coverage — 53 checks, no network
+### 4.1 Pipeline coverage — 54 checks, no network
 
 ```powershell
 python scripts/verify_pipeline.py
 ```
 
 Walks all nine stages of the assignment's pipeline against a throwaway copy of
-the corpus and asserts each. Expect `9/9 stages verified, 52 checks, 0
+the corpus and asserts each. Expect `9/9 stages verified, 53 checks, 0
 failure(s)` — 53 when `AZURE_OPENAI_ENABLED=true`, because stage 8 then
 verifies a real completion instead of the extractive fallback. Exits non-zero on failure, so it can gate CI.
 
@@ -727,6 +756,20 @@ python scripts/ingest.py --force        # creates the index and loads it
 `az … -o tsv` writes to stdout, so PowerShell captures it directly — no `$( )`
 needed, unlike bash.
 
+**The service and the index are two different things, and they have different
+names.** `AZURE_SEARCH_ENDPOINT` names the *service* — the Azure resource you
+provisioned, `srch-northwind-kb` here. `AZURE_SEARCH_INDEX` names an *index
+inside it*, `northwind-kb`. One service holds many indexes, so these are not
+interchangeable and the index should **not** be renamed to match the service. If
+you see
+
+```
+The index 'northwind-kb' for service 'srch-northwind-kb' was not found
+```
+
+the service was found and answered — it is the index that does not exist yet.
+`ingest.py` creates it; see [§9](#9-troubleshooting).
+
 > The equivalent bash script,
 > [`scripts/provision_azure_search.sh`](scripts/provision_azure_search.sh), is
 > still in the repo for macOS and Linux and takes the same settings as
@@ -817,11 +860,21 @@ into every image, both variants — `BAKE_INDEX` controls whether the *index* is
 pre-built, not whether the *documents* are present. §6.3 covers what that means
 and what the alternatives are.
 
+**Nothing can pull the image until an identity is allowed to.** The registry is
+created with admin access off (§6.2), so there is no password to fall back on,
+and the app's own system-assigned identity does not exist yet at the moment of
+the first pull. §6.5 therefore creates a user-assigned identity, grants it
+`AcrPull`, and passes it to `az containerapp create` — do that step or the deploy
+stops at `No credential was provided to access Azure Container Registry`.
+
 **§6 calls `az` directly**, unlike §5.2, whose `Test-AzExists` / `Invoke-Az`
 helpers exist only within that block. Each step here is meant to be read and run
 one at a time. If you want the same fail-fast behaviour, paste §5.2's two helper
 functions into the session first and prefix the mutating calls with `Invoke-Az` —
-but do not assume they are already defined.
+but do not assume they are already defined. On Windows PowerShell 5.1 this
+matters more than it looks: with `$ErrorActionPreference = "Stop"` a mere `az`
+*warning* terminates the command, so check whether a step actually failed before
+re-running it.
 
 ### 6.1 Build the image
 
@@ -906,7 +959,14 @@ does **not** inherit it. Calls that need `AZURE_TLS_VERIFY=false` on the host
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$PSNativeCommandUseErrorActionPreference = $true
+if ($PSVersionTable.PSVersion.Major -ge 7) {
+    # 7.3+: makes a non-zero az *exit code* fatal, which is what we want.
+    $PSNativeCommandUseErrorActionPreference = $true
+} else {
+    # Windows PowerShell 5.1 has no such variable, and "Stop" there makes any az
+    # *warning* a terminating error -- killing commands that actually worked.
+    $ErrorActionPreference = "Continue"
+}
 
 $ResourceGroup = "rg-rag-prod"
 $Location      = "eastus"
@@ -924,7 +984,29 @@ az monitor app-insights component create `
 az containerapp env create -g $ResourceGroup -n cae-rag-prod -l $Location
 ```
 
-Push the image:
+**The preamble is shell-aware on purpose.** The two editions treat a failing
+native command in opposite ways, so no single setting is right for both:
+
+| | Windows PowerShell 5.1 | PowerShell 7 |
+|---|---|---|
+| `$ErrorActionPreference = "Stop"` on `az` | **Any stderr write is fatal — warnings included** | Ignored for native commands |
+| `$PSNativeCommandUseErrorActionPreference` | Does not exist (7.3+ only) | Makes a non-zero **exit code** fatal |
+
+With the branch above, an `az` *warning* never kills the run on either shell —
+which matters, because several `az containerapp` operations warn routinely. The
+trade-off is stated plainly: **on 5.1 a genuine `az` failure will not stop the
+script either.** Check `$LASTEXITCODE` after anything that matters, or run §6 in
+PowerShell 7, where a non-zero exit still throws.
+
+**`--admin-enabled false` is deliberate, and it has a consequence to plan for.**
+It means the registry has no username/password, so Container Apps cannot fall
+back on one and **must** pull with a managed identity that holds `AcrPull`. That
+identity has to exist *before* the app does, which is why §6.5 creates one rather
+than relying on the app's own system-assigned identity. Skip it and the deploy
+reports `No credential was provided to access Azure Container Registry`.
+
+Push the image — `az acr login` uses **your** credentials, which is separate from
+how the *app* authenticates later:
 
 ```powershell
 az acr login -n acrragprod
@@ -1105,11 +1187,67 @@ with it the ability to detect deleted documents. Three options, worst to best:
 
 ### 6.5 Deploy
 
+**Grant registry access first.** §6.2 created the registry with
+`--admin-enabled false`, which is the right posture but means there is no
+username/password for Container Apps to fall back on. If you deploy without
+arranging an identity, `az` reports
+
+```
+WARNING: No credential was provided to access Azure Container Registry.
+Trying to look up credentials...
+```
+
+and the pull fails, because there is nothing to look up.
+
+A **system-assigned** identity cannot solve this on its own: it does not exist
+until the app is created, so it cannot hold `AcrPull` at the moment the first
+image pull happens. `az containerapp registry set --help` says so plainly — *"the
+managed identity should have been assigned acrpull permissions"*. Use a
+**user-assigned** identity, which can be given the role before anything needs it:
+
+```powershell
+$Acr = "acrragprod"
+
+# 1. an identity that exists before the app does
+az identity create -g $ResourceGroup -n id-rag-assistant
+$IdentityId = az identity show -g $ResourceGroup -n id-rag-assistant `
+    --query id -o tsv
+$IdentityPrincipal = az identity show -g $ResourceGroup -n id-rag-assistant `
+    --query principalId -o tsv
+
+# 2. let it pull from the registry -- scoped to that registry, nothing wider
+$AcrId = az acr show -g $ResourceGroup -n $Acr --query id -o tsv
+az role assignment create --assignee $IdentityPrincipal `
+    --role AcrPull --scope $AcrId
+```
+
+**`az role assignment create` needs `Owner` or `User Access Administrator`** —
+`Contributor` is not enough, and this is the step most likely to be refused on a
+corporate subscription. Check with the command in [§2.6](#26-optional-for-the-azure-paths-only-5-6)
+before you start. If it is refused, note that *only that one line* needs the
+elevated right: `az identity create` and everything after it need only
+Contributor, so it is reasonable to hand a subscription owner exactly this:
+
+```powershell
+az role assignment create --assignee "<identity-principal-id>" `
+    --role AcrPull --scope "<acr-resource-id>"
+```
+
+and carry on yourself once it is done. If you cannot get it run at all, §6.6 has
+a route that needs no role assignment.
+
+Role assignments are eventually consistent; if the first deploy still reports a
+pull failure, wait a minute and retry before changing anything.
+
+Then create the app, telling it to authenticate to the registry **as that
+identity** rather than with a password:
+
 ```powershell
 az containerapp create `
   -g $ResourceGroup -n ca-rag-assistant --environment cae-rag-prod `
   --image acrragprod.azurecr.io/rag-assistant:1.0.0 `
   --registry-server acrragprod.azurecr.io `
+  --registry-identity $IdentityId `
   --system-assigned `
   --ingress external --target-port 8000 --transport auto `
   --min-replicas 1 --max-replicas 10 `
@@ -1129,10 +1267,37 @@ az containerapp create `
      LOG_FORMAT=json
 ```
 
+**`--registry-identity` does two jobs, which is why there is no `--user-assigned`
+here.** It attaches the identity to the app *and* tells the app to authenticate
+to the registry with it. Adding `--user-assigned $IdentityId` as well makes the
+CLI add the same identity twice and warn:
+
+```
+WARNING: User identity /subscriptions/…/id-rag-assistant is already assigned to containerapp
+```
+
+That warning is harmless in itself — but on Windows PowerShell 5.1 a warning is
+enough to terminate the command, so it reads like a failure. One flag, not two.
+
+`--system-assigned` stays. It is a **different** identity, created for the app
+itself, and it is the one §6.6 grants Search and OpenAI access to. The two are
+not interchangeable: the user-assigned identity pulls the image, the
+system-assigned identity is how the running app authenticates to Azure services.
+
 **Check for trailing spaces if this block fails to parse.** A backtick is only a
 continuation when it is the *last* character on the line; one stray space after
 it and PowerShell ends the command there, sending `az` roughly half its
 arguments.
+
+> **On Windows PowerShell 5.1 that ACR warning alone will kill the command.**
+> With `$ErrorActionPreference = "Stop"` — which §6.2's preamble sets and which
+> is still in effect later in the same session — *any* `az` write to stderr
+> becomes a terminating `NativeCommandError`, warnings included. The command may
+> have got further than the transcript suggests, so check before re-running:
+> `az containerapp show -g $ResourceGroup -n ca-rag-assistant -o table`.
+> §5.2's `Invoke-Az` helper exists precisely to contain this; §6 calls `az`
+> directly, so either paste that helper in first or run §6 with
+> `$ErrorActionPreference = "Continue"`.
 
 `--min-replicas 1` rather than 0: scale-to-zero means the first question after
 an idle period pays a cold start that includes loading the index.
@@ -1143,30 +1308,194 @@ your production endpoint answers unauthenticated requests with unrestricted
 department scope. `API_ALLOWED_ORIGINS` defaults to `http://localhost:8000`;
 set it to the real origin or the browser will block the UI.
 
+**Notice what is *not* in that list: the two API keys.** They are deliberately
+absent — keys in `--env-vars` are visible in the revision definition — but the
+app cannot reach Azure AI Search without `AZURE_SEARCH_API_KEY`, and it fails
+**quietly**: it falls back to an empty local index and answers
+`insufficient_evidence` to everything. **§6.6 is not optional; finish it before
+testing the app.**
+
 ### 6.6 Secrets and identity
 
 Never pass keys with `--env-vars`; they are visible in the revision definition.
 
+Look the scope ids up rather than pasting them — a role assignment against a
+mistyped scope fails in ways that are tedious to read:
+
 ```powershell
-# grant the app's identity access, then reference secrets from Key Vault
+# The names of the two services, and the resource groups they live in.
+# Search and Azure OpenAI are often NOT in the container app's resource group --
+# §5.2 may well have created them elsewhere -- so these default to
+# $ResourceGroup but can be pointed anywhere.
+$SearchName     = "srch-northwind-kb"
+$OpenAiName     = "oai-vsquarecloud"
+$SearchGroup    = $ResourceGroup
+$OpenAiGroup    = $ResourceGroup
+
+# The app's own (system-assigned) identity -- the one that queries Azure.
+# Not the user-assigned identity from §6.5, which only pulls the image.
 $Principal = az containerapp show -g $ResourceGroup -n ca-rag-assistant `
     --query identity.principalId -o tsv
 
-az role assignment create --assignee $Principal `
-  --role "Search Index Data Reader" --scope "<search-resource-id>"
-az role assignment create --assignee $Principal `
-  --role "Cognitive Services OpenAI User" --scope "<aoai-resource-id>"
+# Resource ids, fetched rather than typed.
+$SearchId = az search service show --name $SearchName -g $SearchGroup `
+    --query id -o tsv
+$OpenAiId = az cognitiveservices account show --name $OpenAiName -g $OpenAiGroup `
+    --query id -o tsv
 
-az containerapp secret set -g $ResourceGroup -n ca-rag-assistant `
-  --secrets "search-key=keyvaultref:https://kv-rag-prod.vault.azure.net/secrets/search-key,identityref:system"
+# Fail loudly here rather than on an empty --scope, which reports a confusing
+# "role assignment scope is invalid" instead of "you typed the name wrong".
+if (-not $Principal) { throw "no system-assigned identity on ca-rag-assistant -- was it created with --system-assigned?" }
+if (-not $SearchId)  { throw "search service '$SearchName' not found in '$SearchGroup'" }
+if (-not $OpenAiId)  { throw "Azure OpenAI account '$OpenAiName' not found in '$OpenAiGroup'" }
+
+"principal : $Principal"
+"search    : $SearchId"
+"openai    : $OpenAiId"
+
+az role assignment create --assignee $Principal `
+  --role "Search Index Data Reader" --scope $SearchId
+az role assignment create --assignee $Principal `
+  --role "Cognitive Services OpenAI User" --scope $OpenAiId
+```
+
+Note `az search service show` takes `--name`, while `az search admin-key show`
+in §5.2 takes `--service-name` — the two subcommands genuinely differ.
+
+Confirm the assignments landed:
+
+```powershell
+az role assignment list --assignee $Principal --all -o table
+```
+
+#### What actually goes in Key Vault
+
+**Exactly two values.** Everything else §6.5 passes is configuration, not
+secrets — endpoints, deployment names, the index name and the boolean flags are
+all safe in the revision definition:
+
+| Vault secret | Becomes | Why it is a secret |
+|---|---|---|
+| `search-key` | `AZURE_SEARCH_API_KEY` | Admin key for Azure AI Search — grants read **and write** on the index |
+| `openai-key` | `AZURE_OPENAI_API_KEY` | Calls billable model deployments |
+
+**§6.2 creates the vault but does not put anything in it**, and the app cannot
+read it until its identity is allowed to. All three steps are needed:
+
+```powershell
+$Vault = "kv-rag-prod"
+
+# 1. Put the two secrets in the vault.
+$SearchKey = az search admin-key show --service-name $SearchName `
+    -g $SearchGroup --query primaryKey -o tsv
+$OpenAiKey = az cognitiveservices account keys list --name $OpenAiName `
+    -g $OpenAiGroup --query key1 -o tsv
+
+az keyvault secret set --vault-name $Vault --name search-key --value $SearchKey -o none
+az keyvault secret set --vault-name $Vault --name openai-key --value $OpenAiKey -o none
+
+# 2. Let the app's identity READ them. New vaults use RBAC by default, so this
+#    is a role assignment, not an access policy.
+$VaultId = az keyvault show -n $Vault -g $ResourceGroup --query id -o tsv
+az role assignment create --assignee $Principal `
+    --role "Key Vault Secrets User" --scope $VaultId
+
+# 3. Reference them, and map them onto the variables the app reads.
+az containerapp secret set -g $ResourceGroup -n ca-rag-assistant --secrets `
+    "search-key=keyvaultref:https://$Vault.vault.azure.net/secrets/search-key,identityref:system" `
+    "openai-key=keyvaultref:https://$Vault.vault.azure.net/secrets/openai-key,identityref:system"
+
 az containerapp update -g $ResourceGroup -n ca-rag-assistant `
-  --set-env-vars AZURE_SEARCH_API_KEY=secretref:search-key
+    --set-env-vars AZURE_SEARCH_API_KEY=secretref:search-key `
+                   AZURE_OPENAI_API_KEY=secretref:openai-key
+```
+
+> **Until this is done the app is not talking to Azure AI Search at all — and it
+> will not tell you loudly.** [`store/factory.py`](src/rag/store/factory.py)
+> treats a missing key as "Azure not configured": with `RETRIEVER_BACKEND=azure`
+> but no `AZURE_SEARCH_API_KEY` it logs one warning —
+> *"falling back to the local backend"* — and carries on with the **local**
+> store. The production image is built `BAKE_INDEX=false`, so that local store is
+> **empty**, and every question then returns `insufficient_evidence` regardless
+> of which department asked.
+>
+> `GET /health` is the tell: it reports `"backend": "local"` and
+> `"documents": 0` instead of `azure-ai-search`. See [§9](#9-troubleshooting).
+
+#### Confirm the keys actually took effect
+
+A revision that never restarted looks exactly like one that did, so check rather
+than assume:
+
+```powershell
+$Fqdn = az containerapp show -g $ResourceGroup -n ca-rag-assistant `
+    --query "properties.configuration.ingress.fqdn" -o tsv
+Invoke-RestMethod "https://$Fqdn/health" | ConvertTo-Json -Depth 6
+```
+
+| Field | Must be | If it is not |
+|---|---|---|
+| `index.backend` | `azure-ai-search` | `AZURE_SEARCH_API_KEY` did not take effect — the app is on the empty local store |
+| `providers.embeddings` | `azure-openai:text-embedding-3-small` | **`AZURE_OPENAI_API_KEY` did not take effect.** The app is embedding at 768 while the index expects 1536, and every query will fail inside the search backend |
+| `index.chunks` | greater than 0 | Ingestion has not run against this index — §6.3 |
+
+**`local-hashing` under `providers.embeddings` is the single clearest signal
+something is missing.** The embedding provider needs *all three* of
+`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY` and
+`AZURE_OPENAI_EMBEDDING_DEPLOYMENT` — any one absent silently selects the local
+embedder. The startup log names whichever is missing:
+
+```
+falling back to the local embedder  missing=AZURE_OPENAI_API_KEY
 ```
 
 The application authenticates with API keys today. Moving to Managed Identity
 end-to-end means swapping the `api-key` header for a bearer token in
 [`src/rag/providers/http.py`](src/rag/providers/http.py) — the role assignments
 above are the half that is already correct.
+
+**If the app already exists without registry access**, you do not need to
+recreate it. Grant `AcrPull` to its system-assigned identity and point the
+registry at it:
+
+```powershell
+$Acr = "acrragprod"
+$Principal = az containerapp show -g $ResourceGroup -n ca-rag-assistant `
+    --query identity.principalId -o tsv
+$AcrId = az acr show -g $ResourceGroup -n $Acr --query id -o tsv
+
+az role assignment create --assignee $Principal --role AcrPull --scope $AcrId
+az containerapp registry set -g $ResourceGroup -n ca-rag-assistant `
+    --server "$Acr.azurecr.io" --identity system
+```
+
+`--identity system` uses the app's own identity; a user-assigned identity's
+resource id works there too. This is the ordering the user-assigned route in
+§6.5 avoids having to unpick — here the identity already exists, so the role can
+finally be granted.
+
+**The fallback, when you cannot create a role assignment at all.** Everything
+above needs `Owner` or `User Access Administrator` (§2.6). Admin credentials do
+not — enabling them needs only `Contributor` on the registry — which makes this
+the honest answer for a locked-down subscription rather than merely a shortcut,
+and it is what the warning means by *"trying to look up credentials"*:
+
+```powershell
+$Acr = "acrragprod"
+az acr update -n $Acr --admin-enabled true
+$AcrUser = az acr credential show -n $Acr --query username -o tsv
+$AcrPass = az acr credential show -n $Acr --query "passwords[0].value" -o tsv
+
+az containerapp registry set -g $ResourceGroup -n ca-rag-assistant `
+    --server "$Acr.azurecr.io" --username $AcrUser --password $AcrPass
+```
+
+**Know what it costs.** That is a long-lived shared credential, it is stored in
+the revision definition, it is not tied to any person, and rotating it means
+touching every app that uses it — which is exactly what §6.2's
+`--admin-enabled false` was avoiding. Treat it as a bridge: get the deployment
+working, then move to the managed-identity route above and
+`az acr update -n $Acr --admin-enabled false` once someone can grant `AcrPull`.
 
 ### 6.7 Probes and scaling
 
@@ -1284,6 +1613,162 @@ With `LOG_FORMAT=json` these land in Log Analytics as structured fields. The
 metrics worth alerting on: abstention rate (a jump means retrieval broke),
 groundedness score, p95 latency by stage, and tokens per question by department.
 
+### Chasing a correlation id
+
+When the UI shows
+
+> Error: An unexpected error occurred. Quote the correlation id when reporting this.
+
+the full traceback is **already recorded**, and no Application Insights setup is
+needed to read it. The API's outermost middleware catches every unhandled
+exception, logs it with `log.exception(...)`, and returns the same correlation id
+it just logged under — so the id on screen is the join key. The JSON formatter
+puts the traceback in an `exception` field and the id in `correlation_id` on
+**every** line.
+
+**Fastest path — tail the container's own log stream:**
+
+```powershell
+az containerapp logs show -g $ResourceGroup -n ca-rag-assistant --tail 200
+az containerapp logs show -g $ResourceGroup -n ca-rag-assistant --follow   # live
+```
+
+`--tail` is capped at 300 lines and reads only the running replica, which is
+enough while reproducing a fault but not for anything historical.
+
+**For history, or to search by id — Log Analytics.** Do not paste a table name
+from memory: **which table holds these logs depends on how the environment was
+configured**, and getting it wrong produces
+`Failed to resolve table or column expression named …`. Find it in three steps.
+
+**Step 1 — where are the logs actually going?**
+
+```powershell
+az containerapp env show -g $ResourceGroup -n cae-rag-prod `
+    --query "properties.appLogsConfiguration" -o json
+```
+
+| `destination` | Table to query |
+|---|---|
+| `log-analytics` (the default) | `ContainerAppConsoleLogs_CL` — a *custom* table, note the suffix |
+| `azure-monitor` | `ContainerAppConsoleLogs` — resource-specific, **no `_CL`** |
+| `none` | Nothing is exported. No query will ever work; use `logs show` |
+
+The same object carries `logAnalyticsConfiguration.customerId` — the workspace
+GUID you query.
+
+**Step 2 — query the workspace, *not* Application Insights.** This is the trap
+that produces the error above with a perfectly correct table name. §6.2 also
+creates `appi-rag-prod`, and Application Insights → Logs offers an identical KQL
+window — but it is scoped to App Insights' own tables (`requests`, `traces`,
+`exceptions`). Container logs are not visible there **even when they exist in the
+workspace**. In the portal, open the **Log Analytics workspace → Logs**.
+
+**Step 3 — find the workspace's *name*.** Step 1 gives its `customerId`, which is
+a GUID; `table list` wants the resource name, and they are not the same thing.
+You almost certainly never chose that name: §6.2 creates the environment without
+`--logs-workspace-id`, so Azure auto-provisions a workspace called something like
+`workspace-rgopenaiabcd`. List them:
+
+```powershell
+az monitor log-analytics workspace list `
+    --query "[].{name:name, group:resourceGroup, customerId:customerId}" -o table
+```
+
+If the subscription has several, match the `customerId` column against the GUID
+from step 1 — that is the one this environment writes to. Narrow with
+`-g $ResourceGroup` if the list is long; the auto-created workspace usually lives
+in the environment's own resource group.
+
+**Then list the tables rather than guessing.** This subcommand is built in; no
+extension needed:
+
+```powershell
+$Workspace = "<name-from-the-list-above>"
+
+az monitor log-analytics workspace table list `
+    -g $ResourceGroup --workspace-name $Workspace `
+    --query "[].name" -o tsv | Where-Object { $_ -like "*ContainerApp*" }
+```
+
+Use the **workspace's own** resource group for `-g` if it differs from the
+container app's.
+
+> **Why the filtering is done in PowerShell rather than in JMESPath.** The
+> obvious `--query "[?contains(name,'ContainerApp')].name"` **fails on Windows**
+> with a message that does not look like it came from `az` at all:
+>
+> ```
+> az : ].name was unexpected at this time.
+> ```
+>
+> That is **cmd.exe**, not the CLI. `az` on Windows is `az.cmd`, a batch shim,
+> and it strips the quotes before re-invoking Python — so cmd.exe ends up parsing
+> the bare `(` and `)` as its own metacharacters. Adding quotes, single quotes or
+> `^` escapes does not help, because the quoting is lost inside the shim.
+>
+> Keeping parentheses out of `--query` sidesteps it entirely, and the pipeline
+> reads better anyway. When a JMESPath **function** is genuinely required, the one
+> form that survives is a single-quoted string *containing* double quotes, so the
+> inner pair reaches cmd.exe intact: `--query '"contains(@,''x'')"'`. Every other
+> `--query` in this document is parenthesis-free and unaffected.
+
+An **empty result** is itself the answer: no container logs have been ingested
+yet. A custom table does not exist until its first record lands, and ingestion
+lags a minute or two — so a query run straight after reproducing a fault can
+legitimately find nothing. Use `az containerapp logs show` for anything you have
+just triggered.
+
+Then run the query, substituting the table name step 3 returned:
+
+```kusto
+// ContainerAppConsoleLogs_CL  when destination = log-analytics (default)
+// ContainerAppConsoleLogs     when destination = azure-monitor
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == "ca-rag-assistant"
+| extend d = parse_json(Log_s)
+| where tostring(d.correlation_id) == "<paste-the-id-from-the-UI>"
+| project TimeGenerated, level = d.level, logger = d.logger,
+          message = d.message, exception = d.exception
+| order by TimeGenerated asc
+```
+
+That returns the request's whole story in order, ending in the traceback. To find
+recent failures when you have no id to start from, swap the `where` for
+`| where d.level == "ERROR"`.
+
+**If the table resolves but a column does not**, the two tables do not share a
+schema — `Log_s` and `ContainerAppName_s` are the custom table's columns. Run
+`<table> | take 5` and read the real shape before trusting the projection above.
+
+From the CLI, running KQL needs an extension that is **not** installed by default
+(unlike `workspace table list`):
+
+```powershell
+az extension add -n log-analytics --upgrade
+$WorkspaceId = az containerapp env show -g $ResourceGroup -n cae-rag-prod `
+    --query "properties.appLogsConfiguration.logAnalyticsConfiguration.customerId" -o tsv
+az monitor log-analytics query -w $WorkspaceId --analytics-query "<the KQL above>" -o table
+```
+
+**What the traceback usually says here.** A non-2xx from Azure AI Search becomes
+a `RuntimeError` in [`store/azure_search.py`](src/rag/store/azure_search.py), and
+the retrieval fan-out does not swallow it — so it surfaces as exactly this 500:
+
+| In the traceback | Means |
+|---|---|
+| `-> 401` or `-> 403` | The search key is wrong, or was set but the revision never restarted. `az containerapp revision list -g $ResourceGroup -n ca-rag-assistant -o table` |
+| `-> 404 … index … was not found` | Ingestion has not run against this service — §6.3 |
+| Azure OpenAI 401 / `DeploymentNotFound` | `AZURE_OPENAI_API_KEY` missing (§6.6), or a deployment name that does not exist |
+
+> **Application Insights is not wired up.**
+> `APPLICATIONINSIGHTS_CONNECTION_STRING` is read into `Settings` and consumed by
+> nothing — there is no exporter, and no OpenTelemetry dependency. The spans are
+> *shaped* for it (one correlation id per request, one timed span per stage), but
+> sending them anywhere means adding an exporter and a dependency to match, which
+> would break this repo's deliberate no-`azure-*` rule. Everything above uses the
+> log stream instead, which carries the same correlation id.
+
 **Cost control**, in descending order of effect: point
 `AZURE_OPENAI_UTILITY_DEPLOYMENT` at a mini model; enable response caching at
 API Management; lower `RAG_CONTEXT_TOP_K`; reduce embedding dimensions; set
@@ -1313,6 +1798,16 @@ per-department quotas at the gateway.
 | Retrieval quality poor, log says `local-hashing` | No embedding deployment | Deploy `text-embedding-3-small` and re-ingest |
 | `embedding dimension changed … will be dropped` | Embedding model changed under an existing index | `python scripts/ingest.py --force` |
 | `Semantic search is not enabled for this service` | Free-tier Search | `AZURE_SEARCH_SEMANTIC=false`, or upgrade to Basic |
+| KQL: `Failed to resolve table or column expression named 'ContainerAppConsoleLogs_CL'` | Usually the **scope**: you are in Application Insights → Logs, which cannot see container logs. Otherwise the table name differs by log destination (`_CL` only for `log-analytics`), or nothing has been ingested yet | Query the **Log Analytics workspace**, and list the tables first — §8 |
+| `az : ].name was unexpected at this time.` (or `-o was unexpected…`) | **cmd.exe**, not `az`. `az.cmd` strips the quotes around `--query` before calling Python, so parentheses in a JMESPath expression are parsed as cmd metacharacters | Keep `(` `)` out of `--query` and filter with `Where-Object` instead; if a JMESPath function is unavoidable use `--query '"fn(@)"'` — §8 |
+| `The index '<index>' for service '<service>' was not found` | The **service** was reached; the **index inside it** does not exist. These are different objects with different names — §5.2 | Re-run `python scripts/ingest.py --force`, which creates it. Do **not** set `AZURE_SEARCH_INDEX` to the service name |
+| **Deployed app answers `insufficient_evidence` to everything, in every department** | `RETRIEVER_BACKEND=azure` but `AZURE_SEARCH_API_KEY` is unset, so the backend factory fell back to the **local** store — which is empty in a `BAKE_INDEX=false` image. It warns once at startup and then looks healthy | `GET /health` shows `"backend": "local"`, `"documents": 0`. Wire the key from Key Vault — §6.6 |
+| Startup log says `falling back to the local backend` | Same as above: `has_azure_search` needs **both** `AZURE_SEARCH_ENDPOINT` and `AZURE_SEARCH_API_KEY`; one alone is silently insufficient | §6.6 |
+| `400 InvalidRequestParameter … the provided vector has a length of '768'` | The app fell back to the **local 768-dim embedder** while the index expects the model's width (1536 for `text-embedding-3-small`). The embedder needs **all three** of endpoint / key / deployment — usually `AZURE_OPENAI_API_KEY` is the missing one | Wire the key — §6.6 — then confirm `providers.embeddings` on `/health` is no longer `local-hashing` |
+| Startup log says `falling back to the local embedder` | Same cause; the log line's `missing=` field names exactly which setting is absent | §6.6 |
+| `WARNING: No credential was provided to access Azure Container Registry` | The registry has admin access disabled (correctly), and no managed identity holds `AcrPull` | Grant `AcrPull` to a user-assigned identity **before** creating the app, and pass `--registry-identity` — §6.5. For an app that already exists, §6.6 |
+| `WARNING: User identity … is already assigned to containerapp` | The same identity was passed to **both** `--registry-identity` and `--user-assigned`; the CLI adds it twice. Harmless in itself — `--registry-identity` already attaches it | Drop `--user-assigned` — §6.5. On 5.1 this warning alone aborts the command, so check whether the app was created before retrying |
+| `az` command dies on a **warning** with `NativeCommandError` | Windows PowerShell 5.1 turns any native stderr write into a terminating error when `$ErrorActionPreference = "Stop"` | Check whether the command actually succeeded before retrying; then use §5.2's `Invoke-Az` or set `$ErrorActionPreference = "Continue"` — §5.2 |
 | Container unreachable through ingress | uvicorn bound to loopback | `--host 0.0.0.0` (already in the image `CMD`) |
 | Replicas restart-looping | `/health` used as a liveness probe | Use TCP for liveness — §6.7 |
 | Deleted documents still answered | Manifest lost between ingest runs | Persist `RAG_DATA_DIR` — §6.4 |

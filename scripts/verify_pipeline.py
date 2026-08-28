@@ -222,8 +222,11 @@ async def stage_4_embeddings(settings, chunks):
 async def stage_5_azure_search(chunks, embedder):
     """Exercise AzureAISearchStore against the offline REST stub."""
     from rag.config import get_settings
+    from rag.ingest.manifest import Manifest, ManifestEntry
+    from rag.ingest.sync import sync
     from rag.store.azure_search import AzureAISearchStore
     from rag.store.base import SearchFilters
+    from rag.store.factory import get_backend
 
     stage = STAGES[4]
     heading(stage)
@@ -342,6 +345,79 @@ async def stage_5_azure_search(chunks, embedder):
         check(stage, "other documents untouched",
               all(c.chunk_id in remaining for c in sample
                   if c.doc_id != target))
+
+        # --- regression: purge must not precede index creation ----------
+        # sync() used to purge modified documents *before* calling
+        # ensure_index. delete_by_doc searches the index to find the chunk ids
+        # to remove, so on a first run against a real service that search hit an
+        # index which did not exist yet and 404'd -- ingestion died before it
+        # could create the index it was about to fill. What triggers it is the
+        # manifest already listing the document: `--force` guarantees that, and
+        # so does pointing an existing local manifest at a new Azure index.
+        #
+        # Reproduced with one document and a stale manifest entry, so the purge
+        # path genuinely runs. Asserting on request *order* rather than "did it
+        # raise" keeps the check meaningful if delete_by_doc ever learns to
+        # tolerate a 404 by itself.
+        fresh_index = "firstrun-kb"
+        scratch = Path(tempfile.mkdtemp(prefix="rag-firstrun-"))
+        saved_data_dir = os.environ.get("RAG_DATA_DIR", "")
+        saved_backend = os.environ.get("RETRIEVER_BACKEND", "")
+        try:
+            # get_backend() reads this; without it the sync would quietly run on
+            # the local store and the assertion would pass on zero requests.
+            os.environ["RETRIEVER_BACKEND"] = "azure"
+            one_doc = scratch / "corpus" / "Sales"
+            one_doc.mkdir(parents=True)
+            shutil.copy2(
+                REPO_ROOT / "KnwoledgeBaseDocuments" / "Sales" / "Pricing2026.pdf",
+                one_doc,
+            )
+
+            os.environ["RAG_DATA_DIR"] = str(scratch / "data")
+            os.environ["AZURE_SEARCH_INDEX"] = fresh_index
+            fresh_settings = get_settings(refresh=True)
+            fresh_backend = await get_backend(fresh_settings)
+
+            # A stale hash makes scan() classify the document as *modified*,
+            # which is what sends it through the purge loop.
+            stale = Manifest(scratch / "data" / "manifest.json")
+            stale.entries["Sales/Pricing2026.pdf"] = ManifestEntry(
+                doc_id="Sales/Pricing2026.pdf",
+                path="Sales/Pricing2026.pdf",
+                content_hash="stale-hash-forces-a-purge",
+                size=1,
+                chunk_ids=["chunk-that-no-longer-exists"],
+            )
+
+            mark = len(stub.requests)
+            failure = ""
+            try:
+                await sync(fresh_settings, fresh_backend, embedder,
+                           source_dir=scratch / "corpus", manifest=stale)
+            except RuntimeError as exc:
+                # This is what the regression looks like: the purge 404s on an
+                # index that has not been created yet. Report it as a failed
+                # check rather than letting it abort the remaining stages.
+                failure = str(exc)[:90]
+            seq = [f"{r['method']} {r['path']}" for r in stub.requests[mark:]]
+            put_at = next((i for i, p in enumerate(seq)
+                           if p == f"PUT /indexes/{fresh_index}"), None)
+            search_at = next((i for i, p in enumerate(seq)
+                              if p == f"POST /indexes/{fresh_index}/docs/search"), None)
+            check(stage, "index created before any purge on a first run",
+                  not failure and put_at is not None
+                  and (search_at is None or put_at < search_at),
+                  failure or f"PUT at {put_at}, first docs/search at {search_at}")
+        finally:
+            os.environ["AZURE_SEARCH_INDEX"] = "verify-kb"
+            if saved_data_dir:
+                os.environ["RAG_DATA_DIR"] = saved_data_dir
+            if saved_backend:
+                os.environ["RETRIEVER_BACKEND"] = saved_backend
+            else:
+                os.environ.pop("RETRIEVER_BACKEND", None)
+            shutil.rmtree(scratch, ignore_errors=True)
 
     # --- semantic unavailable (Free tier) ------------------------------
     with AzureSearchStub(reject_semantic=True) as strict:

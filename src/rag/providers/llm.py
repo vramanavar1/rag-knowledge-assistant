@@ -222,10 +222,18 @@ def get_chat_provider(settings: Settings) -> ChatProvider:
             hint="set AZURE_OPENAI_ENABLED=true to use them",
         )
     else:
+        # Enumerate what is absent rather than naming one setting: partial
+        # configuration is the case that costs debugging time, and a fixed
+        # message can end up pointing at the setting that is already correct.
+        missing = [name for name, value in (
+            ("AZURE_OPENAI_ENDPOINT", settings.aoai_endpoint),
+            ("AZURE_OPENAI_API_KEY", settings.aoai_api_key),
+            ("AZURE_OPENAI_CHAT_DEPLOYMENT", settings.aoai_chat_deployment),
+        ) if not value]
         log.info(
-            "no Azure OpenAI chat deployment configured; "
+            "no Azure OpenAI chat provider; "
             "answers will be extractive and reranking will be lexical",
-            hint="set AZURE_OPENAI_ENABLED=true plus "
-                 "AZURE_OPENAI_ENDPOINT / _API_KEY / _CHAT_DEPLOYMENT",
+            missing=",".join(missing),
+            hint=f"set AZURE_OPENAI_ENABLED=true plus {' and '.join(missing)}",
         )
     return provider
