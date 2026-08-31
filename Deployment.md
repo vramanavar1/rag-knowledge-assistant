@@ -186,7 +186,8 @@ packages it loads are the pair you just installed.
 - Azure OpenAI with a chat deployment; ideally also an embedding deployment and
   a small utility deployment.
 - Azure AI Search, Basic SKU or above if you want the semantic ranker.
-- Docker, for §6.
+- Docker, for §6 — **only if you build locally**. §6.1 offers `az acr build`,
+  which builds and pushes in Azure, so §6 is completable with `az` alone.
 
 #### What permissions you need
 
@@ -894,7 +895,103 @@ listed here only so the difference is visible:
 docker build -t rag-assistant:demo --build-arg BAKE_INDEX=true .
 ```
 
-**Give them different tags.** Both commands previously wrote
+#### Or build in Azure instead — `az acr build`
+
+`az acr build` uploads the build context to Azure Container Registry, builds it
+there, and **pushes on success**. It replaces the whole `docker build` → `az acr
+login` → `docker tag` → `docker push` chain with one command, and needs no local
+Docker at all:
+
+```powershell
+# --- the §6 preamble. Re-paste it in any new shell; it is deterministic. ---
+$Acr   = "acrragprodkb"
+$Sha   = git rev-parse --short HEAD
+$Image = "$Acr.azurecr.io/rag-assistant:$Sha"
+
+if (git status --porcelain) {
+    Write-Warning "uncommitted changes - '$Sha' will not describe what you build"
+}
+
+# same prod image, built on an ACR agent and pushed in one step
+az acr build -r $Acr -t rag-assistant:$Sha --build-arg BAKE_INDEX=false .
+
+# the demo variant, for symmetry -- Path C does not use it
+az acr build -r $Acr -t rag-assistant:demo --build-arg BAKE_INDEX=true .
+```
+
+**The tag is the commit, and that is the point.** An image called `1.0.0` cannot
+tell you which build it holds — rebuild it and two revisions carry the same
+label over different code, which is how a deploy comes to look like it did
+nothing. `$Sha` names exactly one commit, so the answer to "what is running?" is
+readable straight off the revision list.
+
+**A SHA tag on a dirty tree lies**, hence the guard: the build would contain
+uncommitted work that the commit does not. Commit first, or treat the tag as
+approximate and pin by digest (§8) when it has to be provable.
+
+These three lines are the preamble for the rest of §6. Every block below assumes
+`$Acr`, `$Sha` and `$Image`; re-paste them if you open a new shell.
+
+> **These belong to §6.2, not here.** `docker build` is purely local, so it runs
+> at this point in the document. `az acr build` needs the registry to already
+> exist, and `acrragprodkb` is not created until `az acr create` in §6.2. Run them
+> after that step; they are shown here so the two routes can be compared
+> side by side.
+
+**On Windows, set the console encoding first.** `az acr build` streams the build
+log to your terminal, and a default Windows console (cp437 or cp1252) cannot
+encode every character that log may contain — the command then dies with
+`UnicodeEncodeError: 'charmap' codec can't encode characters`:
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+```
+
+**That error does not mean the build failed.** The crash is in the CLI printing
+the log; the task carries on running in Azure and usually finishes and pushes.
+Never re-run a build on the strength of it — ask the registry what actually
+happened:
+
+```powershell
+az acr task list-runs -r $Acr --top 5 -o table
+az acr repository show-tags -n $Acr --repository rag-assistant -o table
+```
+
+`--no-logs` avoids the streaming path altogether, at the cost of no longer
+blocking until the build finishes. §9 has the full entry.
+
+| | `docker build` (§6.1 + §6.2) | `az acr build` (§6.2) |
+|---|---|---|
+| Local Docker daemon | Required | **Not needed** |
+| Steps to registry | 4 — build, login, tag, push | **1** |
+| Where it builds | Your machine | An Azure-hosted agent |
+| Image architecture | Whatever your machine is | Always `linux/amd64` |
+| Registry must exist first | No | **Yes** |
+| What crosses the network | The built image, hundreds of MB | The build context, ~2 MB here |
+
+Two differences matter beyond convenience:
+
+**`-t` is relative to the registry.** `-t rag-assistant:$Sha` resolves to
+`$Acr.azurecr.io/rag-assistant:$Sha` — which is exactly `$Image`, the name §6.4
+and §6.5 pull.
+There is no FQDN to get wrong and no separate `docker tag` step that can drift
+out of step with the deploy.
+
+**It always produces `linux/amd64`.** A local `docker build` on an ARM
+workstation yields an arm64 image that Container Apps cannot run, and nothing
+catches it until the container tries to start. ACR Tasks builds on a Linux amd64
+agent unless `--platform` says otherwise.
+
+`--admin-enabled false` is no obstacle: `az acr build` authenticates through ARM
+with your `az login` identity, the same way `az acr login` does in §6.2. What it
+needs is `AcrPush` on the registry — **your** permission, not the app's `AcrPull`.
+See §2.6, which is where the two identities are told apart.
+
+`BAKE_INDEX` behaves identically on the ACR agent — no Azure credentials reach
+the build environment there either, so the note below applies unchanged.
+
+**Give them different tags.** Both `docker build` commands above previously wrote
 `rag-assistant:latest`, so the second silently replaced the first — and since
 §6.2 pushes by tag, you could ship the demo image to production without noticing.
 It would start, serve a stale index baked at build time, and never contact Azure
@@ -969,7 +1066,8 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
 }
 
 $ResourceGroup = "rg-rag-prod"
-$Location      = "eastus"
+$Location      = "westus"
+$Acr           = "acrragprodkb"        # same value as §6.1's preamble
 
 az group create -n $ResourceGroup -l $Location
 
@@ -977,11 +1075,25 @@ az group create -n $ResourceGroup -l $Location
 # value above, and $OpenAiName set to your Azure OpenAI resource.
 
 # Registry, Key Vault, observability, Container Apps environment
-az acr create -g $ResourceGroup -n acrragprod --sku Basic --admin-enabled false
+az acr create -g $ResourceGroup -n $Acr --sku Basic --admin-enabled false
 az keyvault create -g $ResourceGroup -n kv-rag-prod
 az monitor app-insights component create `
   -g $ResourceGroup -a appi-rag-prod -l $Location --workspace "<log-analytics-id>"
 az containerapp env create -g $ResourceGroup -n cae-rag-prod -l $Location
+```
+
+**`acrragprodkb` is almost certainly taken.** Registry names are **globally
+unique across all of Azure**, not merely unique within your subscription, and
+`az acr create` fails with `already in use` if someone else has claimed it. Pick
+your own — 5–50 characters, lowercase alphanumeric only, no hyphens.
+
+If you change it, change the **`$Acr` assignments** — every command takes the
+registry from that variable, so the literal only appears where `$Acr` is set (the
+§6.1 preamble, §6.2, and the standalone blocks in §6.5, §6.6 and §8) plus the
+prose that names it. Let the search find them:
+
+```powershell
+Select-String -Path Deployment.md -Pattern 'acrragprodkb'
 ```
 
 **The preamble is shell-aware on purpose.** The two editions treat a failing
@@ -1009,46 +1121,82 @@ Push the image — `az acr login` uses **your** credentials, which is separate f
 how the *app* authenticates later:
 
 ```powershell
-az acr login -n acrragprod
-docker tag rag-assistant:prod acrragprod.azurecr.io/rag-assistant:1.0.0
-docker push acrragprod.azurecr.io/rag-assistant:1.0.0
+az acr login -n $Acr
+docker tag rag-assistant:prod $Image
+docker push $Image
 ```
 
-**`rag-assistant:1.0.0` is never built — it is the same image under a second
-name.** There is exactly one `docker build` for production, in §6.1;
+**Or skip all three, and §6.1's build with them.** The registry now exists, so
+`az acr build` can run — it builds on an Azure agent and pushes on success:
+
+```powershell
+az acr build -r $Acr -t rag-assistant:$Sha --build-arg BAKE_INDEX=false .
+```
+
+On Windows, set `$env:PYTHONIOENCODING = "utf-8"` before running it — see §6.1.
+Without it the command can die with `UnicodeEncodeError` **while the build keeps
+running in Azure**, which reads as a build failure and is not one.
+
+That is the whole route: no local Docker daemon, no `az acr login`, no `docker
+tag`, no `docker push`. It authenticates through ARM with the identity `az login`
+established, so `--admin-enabled false` does not stand in its way — but it does
+need **`AcrPush` on the registry**, which is a permission held by *you*, not by
+the app's managed identity. §2.6 has the distinction.
+
+Everything downstream is unchanged: the image lands under the same name, and
+§6.3 through §6.5 neither know nor care which route produced it.
+
+**On the `docker` route, `$Image` is never built — it is the same image under a
+second name.** There is exactly one `docker build` for production, in §6.1;
 `docker tag` adds a name, it does not rebuild anything. The full chain, and what
 the image is called at each step:
 
 | Step | Command | Name |
 |---|---|---|
 | §6.1 build | `docker build -t rag-assistant:prod --build-arg BAKE_INDEX=false .` | `rag-assistant:prod` |
-| §6.2 tag | `docker tag rag-assistant:prod acrragprod.azurecr.io/rag-assistant:1.0.0` | *both* names, one image |
-| §6.2 push | `docker push acrragprod.azurecr.io/rag-assistant:1.0.0` | in the registry |
-| §6.4 / §6.5 | `--image acrragprod.azurecr.io/rag-assistant:1.0.0` | pulled from the registry |
+| §6.2 tag | `docker tag rag-assistant:prod $Image` | *both* names, one image |
+| §6.2 push | `docker push $Image` | in the registry |
+| §6.4 / §6.5 | `--image $Image` | pulled from the registry |
 
 `docker images` after the tag shows two rows sharing one IMAGE ID — that is the
 same image, not a copy.
 
-Two parts of that name are doing different jobs. `acrragprod.azurecr.io/` is the
-registry, and it is what makes the name pushable — Docker infers the registry
-from the name, so a tag without it would try to push to Docker Hub. `1.0.0` is a
-version **you choose**; nothing derives it from the repo.
+**On the `az acr build` route that is not true**, and the difference is worth
+holding on to: there is no intermediate `rag-assistant:prod`, because the
+commit-tagged name *is* the build target. The first three rows collapse into one:
 
-**If you bump the version, bump it everywhere.** The literal appears in five
-runnable places — the `tag` and `push` above, the ingest-Job YAML in §6.3, the
-Job in §6.4, and the deploy in §6.5 — and they must all agree, or you will deploy
-an image you did not just push:
+| Step | Command | Name |
+|---|---|---|
+| §6.2 build + push | `az acr build -r $Acr -t rag-assistant:$Sha --build-arg BAKE_INDEX=false .` | in the registry |
+| §6.4 / §6.5 | `--image $Image` | pulled from the registry |
 
-```powershell
-Select-String -Path Deployment.md -Pattern 'rag-assistant:1\.0\.0'
-```
+Nothing lands in your local `docker images` on this route — the image only ever
+exists in the registry.
 
-They are written out rather than held in a `$Version` variable on purpose: each
-block is meant to run on its own, and a variable set in this fence would be empty
-in a later one.
+Two parts of that name do different jobs. `$Acr.azurecr.io/` is the registry, and
+it is what makes the name pushable — Docker infers the registry from the name, so
+a tag without it would try to push to Docker Hub. `$Sha` is the **identity**: it
+says which commit this image was built from.
 
-Use a version, not `latest` — Container Apps revisions are how you roll back, and
-they need distinguishable images.
+**There is nothing to bump.** Every command in §6 takes its image from `$Image`,
+so the version exists in exactly one place — the preamble — and it is computed,
+not chosen. This replaces an earlier scheme where a literal `1.0.0` appeared in
+nine runnable places and every one had to be edited in step. That scheme failed
+in the way such schemes do: a rebuilt tag left two revisions carrying one label
+over different code, and working out which was deployed meant comparing traceback
+line numbers against the repository.
+
+An earlier note in this section argued against a variable, on the grounds that
+each block should run on its own and a variable set in one fence is empty in the
+next. That objection applied to a *chosen* version like `$Version`, which you
+cannot reconstruct without remembering it. `$Sha` is derived from the repository,
+so re-pasting the three preamble lines in a fresh shell always reproduces it, and
+the blocks stay independently runnable.
+
+Use a commit, not `latest` and not a hand-picked number — Container Apps
+revisions are how you roll back, and they need images that can be told apart. A
+commit id is the strongest form of that: it is unique per build *and* it points
+back at the source.
 
 ### 6.3 Load the index — and where the corpus comes from
 
@@ -1130,7 +1278,7 @@ properties:
   template:
     containers:
       - name: rag-ingest
-        image: acrragprod.azurecr.io/rag-assistant:1.0.0
+        image: __IMAGE__
         command: ["python"]
         args: ["scripts/ingest.py"]
         env:
@@ -1147,9 +1295,17 @@ properties:
         storageName: corpusmount
 ```
 
+**`__IMAGE__` is a placeholder, because YAML cannot read a shell variable.**
+Render it before applying, so the Job and the API provably run the same build —
+a Job left on an older image re-indexes with a different embedder, which is the
+mismatch of §9 arriving by the back door:
+
 ```powershell
+(Get-Content ingest-job.yaml -Raw).Replace('__IMAGE__', $Image) |
+    Set-Content ingest-job.resolved.yaml
+
 az containerapp job create -g $ResourceGroup -n job-rag-ingest `
-    --environment cae-rag-prod --yaml ingest-job.yaml
+    --environment cae-rag-prod --yaml ingest-job.resolved.yaml
 ```
 
 With this in place, updating the knowledge base is a file upload rather than an
@@ -1169,7 +1325,7 @@ with it the ability to detect deleted documents. Three options, worst to best:
    az containerapp job create -g $ResourceGroup -n job-rag-ingest `
      --environment cae-rag-prod --trigger-type Schedule `
      --cron-expression "0 */6 * * *" `
-     --image acrragprod.azurecr.io/rag-assistant:1.0.0 `
+     --image $Image `
      --command "python" --args "scripts/ingest.py"
    ```
 
@@ -1206,7 +1362,7 @@ managed identity should have been assigned acrpull permissions"*. Use a
 **user-assigned** identity, which can be given the role before anything needs it:
 
 ```powershell
-$Acr = "acrragprod"
+$Acr = "acrragprodkb"
 
 # 1. an identity that exists before the app does
 az identity create -g $ResourceGroup -n id-rag-assistant
@@ -1245,8 +1401,8 @@ identity** rather than with a password:
 ```powershell
 az containerapp create `
   -g $ResourceGroup -n ca-rag-assistant --environment cae-rag-prod `
-  --image acrragprod.azurecr.io/rag-assistant:1.0.0 `
-  --registry-server acrragprod.azurecr.io `
+  --image $Image `
+  --registry-server "$Acr.azurecr.io" `
   --registry-identity $IdentityId `
   --system-assigned `
   --ingress external --target-port 8000 --transport auto `
@@ -1262,10 +1418,34 @@ az containerapp create `
      AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-4o `
      AZURE_OPENAI_UTILITY_DEPLOYMENT=gpt-4o-mini `
      AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-small `
+     AZURE_OPENAI_EMBEDDING_DIMENSIONS=1536 `
      API_ALLOW_ANONYMOUS=false `
      API_ALLOWED_ORIGINS=https://chat.northwindtraders.example `
-     LOG_FORMAT=json
+     LOG_FORMAT=json `
+     SHOW_ENV_VALUES=false
 ```
+
+**`AZURE_OPENAI_EMBEDDING_DIMENSIONS` must equal the width `northwind-kb` was
+built with.** It is passed straight through on every embedding call, so it
+decides the length of every query vector; 1536 is `text-embedding-3-small`'s
+native width, which is where the number comes from. It is stated here rather than
+left to the default because it is the one setting that determines whether a query
+can match the index at all — and a deploy command that does not name it is making
+a silent claim about a remote artifact.
+
+**Changing the embedding model or width means re-ingesting the corpus *and*
+changing this line.** The two are a pair. If they disagree the app now refuses to
+start, logging both widths (§9) — which is what makes pinning an explicit value
+safe rather than a trap.
+
+**`SHOW_ENV_VALUES=false` is stated even though `false` is already the code
+default**, for the same reason `RAG_PROFILE` and `LOG_FORMAT` are: the deploy
+should describe the posture it creates rather than rely on one. It carries real
+weight here — the flag exposes a configuration report on the public, unauthenticated
+`/health` (§7), and the only way to switch it on is `--set-env-vars`, which
+**merges**. Once set to `true` it survives every later update, so a deployment
+that never states `false` has no way back to it. §6.6 and §6.7 re-assert it for
+the same reason.
 
 **`--registry-identity` does two jobs, which is why there is no `--user-assigned`
 here.** It attaches the identity to the app *and* tells the app to authenticate
@@ -1406,9 +1586,17 @@ az containerapp secret set -g $ResourceGroup -n ca-rag-assistant --secrets `
     "openai-key=keyvaultref:https://$Vault.vault.azure.net/secrets/openai-key,identityref:system"
 
 az containerapp update -g $ResourceGroup -n ca-rag-assistant `
+    --image $Image `
     --set-env-vars AZURE_SEARCH_API_KEY=secretref:search-key `
-                   AZURE_OPENAI_API_KEY=secretref:openai-key
+                   AZURE_OPENAI_API_KEY=secretref:openai-key `
+                   AZURE_OPENAI_EMBEDDING_DIMENSIONS=1536 `
+                   SHOW_ENV_VALUES=false
 ```
+
+**`--image` is here for a reason that is easy to miss.** A revision created by
+`--set-env-vars` alone **inherits the image the app already had**, so an update
+can apply new configuration to old code and report success. Naming the image on
+every update makes the deployed version explicit rather than implied.
 
 > **Until this is done the app is not talking to Azure AI Search at all — and it
 > will not tell you loudly.** [`store/factory.py`](src/rag/store/factory.py)
@@ -1459,7 +1647,7 @@ recreate it. Grant `AcrPull` to its system-assigned identity and point the
 registry at it:
 
 ```powershell
-$Acr = "acrragprod"
+$Acr = "acrragprodkb"
 $Principal = az containerapp show -g $ResourceGroup -n ca-rag-assistant `
     --query identity.principalId -o tsv
 $AcrId = az acr show -g $ResourceGroup -n $Acr --query id -o tsv
@@ -1481,7 +1669,7 @@ the honest answer for a locked-down subscription rather than merely a shortcut,
 and it is what the warning means by *"trying to look up credentials"*:
 
 ```powershell
-$Acr = "acrragprod"
+$Acr = "acrragprodkb"
 az acr update -n $Acr --admin-enabled true
 $AcrUser = az acr credential show -n $Acr --query username -o tsv
 $AcrPass = az acr credential show -n $Acr --query "passwords[0].value" -o tsv
@@ -1501,9 +1689,18 @@ working, then move to the managed-identity route above and
 
 ```powershell
 az containerapp update -g $ResourceGroup -n ca-rag-assistant `
+  --image $Image `
   --scale-rule-name concurrency --scale-rule-type http `
-  --scale-rule-http-concurrency 20
+  --scale-rule-http-concurrency 20 `
+  --set-env-vars SHOW_ENV_VALUES=false `
+                 AZURE_OPENAI_EMBEDDING_DIMENSIONS=1536
 ```
+
+Neither `--image` nor `--set-env-vars` is about scaling. Every `az containerapp
+create`/`update` in this document names the image and re-asserts the same two
+settings, so whichever one you ran last, you know which code is deployed, the
+`/health` env report (§7) is off, and the embedding width still matches the
+index. `--set-env-vars` merges, leaving the other variables untouched.
 
 Probe configuration, via YAML on the container:
 
@@ -1535,7 +1732,7 @@ the app runs fully locally and says so.
 | `AZURE_OPENAI_CHAT_DEPLOYMENT` | falls back to `AZURE_OPENAI_DEPLOYMENT_NAME` | Answer synthesis |
 | `AZURE_OPENAI_UTILITY_DEPLOYMENT` | chat deployment | Rerank / condense / verify / judge. **Point at a mini model** |
 | `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | — | Unset ⇒ local hashed-feature embedder |
-| `AZURE_OPENAI_EMBEDDING_DIMENSIONS` | `1536` | Corrected from a live probe if it differs |
+| `AZURE_OPENAI_EMBEDDING_DIMENSIONS` | `1536` | **Must equal the index's vector width.** Checked at startup; a mismatch stops the app — §9 |
 
 ### Azure AI Search
 
@@ -1585,6 +1782,87 @@ the app runs fully locally and says so.
 | `LOG_LEVEL` | `INFO` | Standard levels |
 | `LOG_FORMAT` | `json` | `json` or `text` |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | — | Reserved; the exporter is a stub |
+| `SHOW_ENV_VALUES` | `false` | Adds a redacted `env` block to `/health`. See below |
+| `STARTUP_FAIL_MODE` | `unready` | What a violated startup contract does. `unready`: stay up, fail readiness, report at `/health`. `crash`: exit at boot |
+
+**`STARTUP_FAIL_MODE` — refusing to serve, two ways.** With
+`RETRIEVER_BACKEND=azure` the app checks at boot that the embedder's vector width
+matches the index's. On a mismatch it will not answer questions either way; the
+setting decides what is left behind to diagnose with:
+
+| | `unready` (default) | `crash` |
+|---|---|---|
+| Process | stays up | exits; Container Apps restart-loops it |
+| Readiness | fails → takes no traffic | no replica at all |
+| `/health` | **503** with `startup_errors` + `embedding_decision` | unreachable |
+| `/chat` | 503 quoting the reason | unreachable |
+| Log stream | works | **cannot attach — no replica** |
+
+`unready` is the default because a crashed container takes the evidence with it:
+no `/health`, and `Unable to open a connection to your app` from the log stream.
+Both modes are equally safe — neither serves an answer it cannot ground — so the
+one that can be interrogated wins. Use `crash` where a failed revision must never
+linger, and read the reason from Log Analytics (§8).
+
+**`SHOW_ENV_VALUES` — diagnosing configuration from outside the container.**
+Set it to `true` and `/health` gains an `env` block listing every variable the
+app reads, **including the ones that are unset**:
+
+```jsonc
+"env": {
+  "AZURE_OPENAI_ENDPOINT":   "https://aoai-rag.openai.azure.com",
+  "AZURE_OPENAI_API_KEY":    "<EMPTY>",                      // set, but resolved to nothing
+  "AZURE_SEARCH_API_KEY":    "<set len=32 sha256:9f2a1c7d>", // set, value never shown
+  "AZURE_SEARCH_SEMANTIC":   "<UNSET> (default: true)"       // never configured
+}
+```
+
+The three states are the whole point, and `az containerapp show` cannot
+distinguish them: a variable mapped to `secretref:openai-key` displays a *name
+but no value*, so a Key Vault reference that fails to resolve — a missing **Key
+Vault Secrets User** role assignment, a renamed secret, a vault firewall — looks
+identical to a working one in the portal while the container receives an empty
+string. `<EMPTY>` versus `<UNSET>` names that failure directly.
+
+Secret values are **never** rendered, flag or no flag: names matching
+`KEY|SECRET|TOKEN|PASSWORD|CONNECTION_STRING|CREDENTIAL|SAS` show a length and a
+short SHA-256 fingerprint instead, and secrets under 16 characters omit even the
+fingerprint. The hash is there so you can tell "the key changed between
+revisions" from "this matches the vault" without seeing either.
+
+The list cannot drift from the code: it is recorded as a side effect of the
+`_env()` helpers in [`config.py`](src/rag/config.py), so a new setting appears in
+the report the moment it is read.
+
+```powershell
+# on, to diagnose
+az containerapp update -g $ResourceGroup -n ca-rag-assistant `
+    --set-env-vars SHOW_ENV_VALUES=true
+
+# off again
+az containerapp update -g $ResourceGroup -n ca-rag-assistant `
+    --set-env-vars SHOW_ENV_VALUES=false
+```
+
+**Turning it off has to be explicit.** `--set-env-vars` *merges* — it never
+removes — so there is no state in which the variable simply stops being `true`.
+`--remove-env-vars SHOW_ENV_VALUES` is the other way, and differs subtly: it
+deletes the variable and lets the code default (`false`) apply, rather than
+pinning it. Either is fine; doing neither leaves the report exposed.
+
+Each of these creates a **new revision**, so the change takes effect only once
+that revision is serving traffic — check with
+`az containerapp revision list -g $ResourceGroup -n ca-rag-assistant -o table`
+before concluding the flag did not work.
+
+> **The deploy commands fight you here, deliberately.** §6.5, §6.6 and §6.7 all
+> assert `SHOW_ENV_VALUES=false`, so running any of them mid-investigation turns
+> the report back off. That is the intended safety net, not a bug — re-assert
+> `true` afterwards if you are still diagnosing.
+
+> **Turn it off when you are done.** `/health` carries no auth dependency and
+> ingress is public. Values are safe, but the variable *names* map your
+> deployment and are worth not publishing.
 
 ---
 
@@ -1595,6 +1873,68 @@ unchanged documents are neither parsed nor embedded, modified documents have
 their previous chunks purged before new ones land, and deleted documents are
 removed. Re-running with no changes makes zero embedding calls. Details in
 [docs/ingestion-flow.md](docs/ingestion-flow.md).
+
+**When the code changes.** Commit, rebuild, then point the app at the new image.
+All three matter: an uncommitted change produces a tag that does not describe it,
+building alone changes nothing that is running, and updating without `--image`
+creates a revision that inherits the old one.
+
+```powershell
+# 1. commit -- the tag IS the commit, so this comes first
+git commit -am "..."
+
+# 2. recompute the preamble; $Sha now names the commit you just made
+$Acr   = "acrragprodkb"
+$Sha   = git rev-parse --short HEAD
+$Image = "$Acr.azurecr.io/rag-assistant:$Sha"
+
+# 3. build and push
+az acr build -r $Acr -t rag-assistant:$Sha --build-arg BAKE_INDEX=false .
+
+# 4. deploy it -- this is the step that actually changes the running code
+az containerapp update -g $ResourceGroup -n ca-rag-assistant --image $Image
+
+# 5. confirm the new revision is the one serving, and that it is running YOUR commit
+az containerapp revision list -g $ResourceGroup -n ca-rag-assistant -o table
+az containerapp show -g $ResourceGroup -n ca-rag-assistant `
+  --query "properties.template.containers[0].image" -o tsv     # ends in $Sha
+
+# 6. confirm it came up correctly
+curl -s "https://<fqdn>/health" | ConvertFrom-Json | Select-Object -ExpandProperty providers
+```
+
+**Step 5 is not optional.** An update creates a revision; it does not promise the
+revision is healthy or that traffic moved to it. A revision that fails to start
+leaves the previous one serving — which presents as "the deploy did nothing".
+Because the tag names a commit, that check is now conclusive: the image string
+either ends in the commit you just built or it does not.
+
+**Never rebuild an existing tag.** Committing first makes this automatic, which
+is the point — a new commit is a new tag. Reusing one puts two revisions under a
+single label over different code, with nothing afterwards able to say which is
+which. It also fails mechanically: an update whose image string is unchanged,
+with nothing else changed in the template, has no diff to apply and may produce
+no new revision at all, so the build never rolls out.
+
+**If you must build without committing** — a quick experiment — the tag will not
+describe the image, and §6.1's preamble warns about it. Pin by digest instead,
+which is derived from the content and cannot mislead:
+
+```powershell
+$Digest = az acr repository show -n $Acr --image rag-assistant:$Sha `
+            --query digest -o tsv
+$Pinned = "$Acr.azurecr.io/rag-assistant@$Digest"
+```
+
+Read back from the registry rather than parsed out of `az acr build`, whose
+streamed logs share stdout with its result. Then deploy `$Pinned`:
+
+```powershell
+az containerapp update -g $ResourceGroup -n ca-rag-assistant --image $Pinned
+```
+
+And if a tag genuinely has to be reused, `az containerapp revision copy` forces a
+fresh revision rather than relying on a template diff that is not there.
 
 **Cache invalidation.** `POST /api/v1/ingest` clears the answer cache when
 anything was written or purged. External ingestion (§6.4) does not — restart the
@@ -1803,15 +2143,26 @@ per-department quotas at the gateway.
 | `The index '<index>' for service '<service>' was not found` | The **service** was reached; the **index inside it** does not exist. These are different objects with different names — §5.2 | Re-run `python scripts/ingest.py --force`, which creates it. Do **not** set `AZURE_SEARCH_INDEX` to the service name |
 | **Deployed app answers `insufficient_evidence` to everything, in every department** | `RETRIEVER_BACKEND=azure` but `AZURE_SEARCH_API_KEY` is unset, so the backend factory fell back to the **local** store — which is empty in a `BAKE_INDEX=false` image. It warns once at startup and then looks healthy | `GET /health` shows `"backend": "local"`, `"documents": 0`. Wire the key from Key Vault — §6.6 |
 | Startup log says `falling back to the local backend` | Same as above: `has_azure_search` needs **both** `AZURE_SEARCH_ENDPOINT` and `AZURE_SEARCH_API_KEY`; one alone is silently insufficient | §6.6 |
+| `/health` → **503**, `"status": "degraded"`, with a `startup_errors` block | **Deliberate.** With `RETRIEVER_BACKEND=azure` the index's vector width and the embedder's must match; the app refuses traffic rather than 500 on every question. `/chat` returns 503 quoting the same reason | `curl /health` and read `startup_errors[0].reason` and `.fix`, plus the `embedding_decision` trace beside it — the whole diagnosis, no logs needed |
+| `startup_errors[0].check` = `index_embedder_width_agreement` | The embedder is producing a different width than the index holds — almost always because it fell back to `local-hashing` (768) against a 1536 index | `reason` names why it fell back. Wire the key (§6.6), fix the deployment name, or re-ingest at the embedder's width |
+| `startup_errors[0].check` = `store_backend_agreement` | `RETRIEVER_BACKEND=azure` but `AZURE_SEARCH_ENDPOINT`/`_API_KEY` is empty, so the store fell back to the local one — empty in a `BAKE_INDEX=false` image | Set the variable named in `reason`. A `secretref` resolving to an empty string looks identical to a correct one in the portal — `SHOW_ENV_VALUES` distinguishes `<EMPTY>` from `<UNSET>` |
+| `embedding_decision` step `probe` = `FAILED`, error `DeploymentNotFound` | **Deployment name ≠ model name.** `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` must be the name *you gave the deployment*, not the model it runs. The trace prints the exact URL called, so the wrong name is visible in it | `az cognitiveservices account deployment list -g $ResourceGroup -n <aoai> --query "[].{deployment:name, model:properties.model.name}" -o table` — use the **deployment** column. Note `AZURE_OPENAI_CHAT_DEPLOYMENT` falls back to `AZURE_OPENAI_DEPLOYMENT_NAME`, but embeddings have **no such fallback**, which is why chat can work while embeddings silently do not |
+| New code deployed, but the old behaviour persists | `az containerapp update --set-env-vars` **without** `--image` creates a revision that inherits the previous image — new config, old code | Pass `--image $Image` — §8. Then read the running image back: `az containerapp show … --query "properties.template.containers[0].image" -o tsv`. It ends in a commit id, so it either matches the commit you built or it does not |
+| Unsure which build a revision is running | Historic: a hand-picked tag like `1.0.0` reused across builds cannot answer it | The tag is the commit. `git log --oneline` the id from the image string to see exactly what is deployed |
+| Log stream: `Unable to open a connection to your app` **and** the app serves nothing | Log streaming attaches to a *running replica*. If the container is crash-looping there is nothing to attach to, and this message is the symptom, not a network problem | Check `az containerapp revision list -o table`. With the default `STARTUP_FAIL_MODE=unready` a contract failure no longer crashes the container, so this should only appear for a genuine crash. Read the reason from Log Analytics — `ContainerAppConsoleLogs_CL`, §8 |
 | `400 InvalidRequestParameter … the provided vector has a length of '768'` | The app fell back to the **local 768-dim embedder** while the index expects the model's width (1536 for `text-embedding-3-small`). The embedder needs **all three** of endpoint / key / deployment — usually `AZURE_OPENAI_API_KEY` is the missing one | Wire the key — §6.6 — then confirm `providers.embeddings` on `/health` is no longer `local-hashing` |
 | Startup log says `falling back to the local embedder` | Same cause; the log line's `missing=` field names exactly which setting is absent | §6.6 |
 | `WARNING: No credential was provided to access Azure Container Registry` | The registry has admin access disabled (correctly), and no managed identity holds `AcrPull` | Grant `AcrPull` to a user-assigned identity **before** creating the app, and pass `--registry-identity` — §6.5. For an app that already exists, §6.6 |
+| `az acr build`: `UnicodeEncodeError: 'charmap' codec can't encode characters` | **The build is not failing.** The CLI crashed *printing* the log — the traceback ends in `colorama` → `cp1252.py`, called from `_stream_logs`, which only runs once the build is already going. pip's progress bar uses `━` (U+2501); a cp437/cp1252 console cannot encode it. The ACR task continues server-side | `$env:PYTHONIOENCODING = "utf-8"` before the build (§6.1), or `--no-logs`. **Check before rebuilding** — `az acr task list-runs -r acrragprodkb -o table`; the image is usually already pushed. `PIP_PROGRESS_BAR=off` in the Dockerfile removes the character at source |
+| `az acr build`: `not authorized to perform Microsoft.ContainerRegistry/registries/push/write` | The mirror image of the row above, and easy to confuse with it: this is **you** lacking `AcrPush`, not the app lacking `AcrPull`. `Contributor` on the resource group does not imply push rights on the registry | Grant yourself `AcrPush` (or Contributor/Owner) scoped to the registry — §2.6 |
+| `error during connect: … the docker daemon is not running` | Docker Desktop is not started. Applies only to the local `docker build` route | Start Docker Desktop — or take the `az acr build` route in §6.1, which needs no local daemon |
 | `WARNING: User identity … is already assigned to containerapp` | The same identity was passed to **both** `--registry-identity` and `--user-assigned`; the CLI adds it twice. Harmless in itself — `--registry-identity` already attaches it | Drop `--user-assigned` — §6.5. On 5.1 this warning alone aborts the command, so check whether the app was created before retrying |
 | `az` command dies on a **warning** with `NativeCommandError` | Windows PowerShell 5.1 turns any native stderr write into a terminating error when `$ErrorActionPreference = "Stop"` | Check whether the command actually succeeded before retrying; then use §5.2's `Invoke-Az` or set `$ErrorActionPreference = "Continue"` — §5.2 |
 | Container unreachable through ingress | uvicorn bound to loopback | `--host 0.0.0.0` (already in the image `CMD`) |
 | Replicas restart-looping | `/health` used as a liveness probe | Use TCP for liveness — §6.7 |
 | Deleted documents still answered | Manifest lost between ingest runs | Persist `RAG_DATA_DIR` — §6.4 |
 | Anyone can query any department | `API_ALLOW_ANONYMOUS` left at `true` | Set `false` |
+| `/health` returns an `env` block listing your configuration | `SHOW_ENV_VALUES` left at `true` after troubleshooting. `--set-env-vars` merges, so it survives every later update until something sets it back | `--set-env-vars SHOW_ENV_VALUES=false` — §7. Secret **values** were never exposed; the variable *names* were |
 
 ---
 

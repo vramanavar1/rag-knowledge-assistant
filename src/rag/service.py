@@ -12,9 +12,10 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import asdict
 from typing import Any
 
-from rag.config import Settings, get_settings
+from rag.config import Settings, get_settings, redacted_env
 from rag.generate.answer import AnswerGenerator
 from rag.models import Answer, Principal, Turn
 from rag.observability.tracing import (
@@ -25,6 +26,7 @@ from rag.observability.tracing import (
 from rag.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from rag.providers.llm import ChatProvider, get_chat_provider
 from rag.retrieve.pipeline import Retriever
+from rag.startup import StartupContractError, check_startup_contract, describe
 from rag.store.base import SearchBackend
 from rag.store.factory import get_backend
 
@@ -101,6 +103,10 @@ class AssistantService:
         self.backend = backend
         self.llm = llm
 
+        # Populated by `create`. Non-empty means the wiring cannot serve a
+        # correct answer: readiness fails and /chat refuses, quoting the reason.
+        self.startup_errors: list[dict[str, Any]] = []
+
         self.retriever = Retriever(settings, backend, embedder, llm)
         self.generator = AnswerGenerator(settings, llm)
         self.cache = AnswerCache()
@@ -114,7 +120,18 @@ class AssistantService:
         llm = get_chat_provider(settings)
         await llm.probe()
 
+        # A wiring that cannot serve a correct answer must not quietly 500 on the
+        # first question. Under `unready` (the default) the process stays up but
+        # fails readiness, so the reason is reachable at /health -- a crashed
+        # container has no replica, and therefore no /health and no log stream,
+        # which is exactly when the diagnosis is most wanted. Local runs are
+        # unaffected either way.
+        violations = await check_startup_contract(settings, embedder, backend)
+        if violations and settings.startup_fail_mode == "crash":
+            raise StartupContractError(describe(violations[0]))
+
         service = cls(settings, embedder, backend, llm)
+        service.startup_errors = [asdict(v) for v in violations]
 
         stats = await backend.stats(full=True)   # once, at startup
         log.info(
@@ -215,8 +232,11 @@ class AssistantService:
         else:
             stats = await self.backend.stats()      # cheap path: no aggregation
             self._health_cache = (now, stats)
-        ready = stats.chunks > 0
-        return {
+        # A contract violation outranks an empty index: it is the reason the
+        # instance must not take traffic, and it is what the operator needs to
+        # read first.
+        ready = stats.chunks > 0 and not self.startup_errors
+        report: dict[str, Any] = {
             "status": "ready" if ready else "degraded",
             "profile": self.settings.profile,
             "index": {
@@ -239,5 +259,28 @@ class AssistantService:
                     self.settings.azure_openai_credentials_present,
             },
             "cache": {"hits": self.cache.hits, "misses": self.cache.misses},
-            "detail": None if ready else "index is empty - run scripts/ingest.py",
+            "detail": (
+                None if ready
+                else self.startup_errors[0]["reason"] if self.startup_errors
+                else "index is empty - run scripts/ingest.py"
+            ),
         }
+
+        if self.startup_errors:
+            report["startup_errors"] = self.startup_errors
+            # The decision trace is *why* the contract failed, so it ships with
+            # the failure rather than waiting behind a flag and a redeploy. It
+            # carries no secret -- see `_redact` in providers/embeddings.py.
+            trace = getattr(self.embedder, "decision_trace", [])
+            if trace:
+                report["embedding_decision"] = trace
+
+        # Opt-in troubleshooting block. Values are redacted by `redacted_env()`
+        # itself, not here -- the flag decides whether the block exists, never
+        # whether a secret is legible.
+        if self.settings.show_env_values:
+            report["env"] = redacted_env()
+            report.setdefault("embedding_decision",
+                              getattr(self.embedder, "decision_trace", []))
+
+        return report

@@ -201,6 +201,29 @@ async def sync(
     # it can create the index it is about to fill.
     #
     # PUT is create-or-update, so running it first stays idempotent.
+    # Ingesting with an embedder of a different width than the existing index is
+    # how a broken index gets made in the first place. Azure only: there a vector
+    # field's width is immutable, so `ensure_index` would fail regardless -- but
+    # with a message about the field rather than about the embedder that caused
+    # it. The local store handles the same situation by design, dropping its
+    # vectors and rebuilding (see `LocalHybridStore.ensure_index`), so it must
+    # keep reaching that path rather than being stopped here.
+    existing_width = (
+        await backend.vector_width()
+        if settings.retriever_backend == "azure" else 0
+    )
+    if existing_width and existing_width != embedder.dimensions:
+        reason = getattr(embedder, "fallback_reason", "")
+        raise RuntimeError(
+            f"index '{getattr(backend, '_index', backend.name)}' stores "
+            f"{existing_width}-wide vectors but the active embedder "
+            f"'{embedder.name}' produces {embedder.dimensions}. "
+            + (f"The embedder fell back: {reason}. " if reason else "")
+            + "Ingesting now would mix incompatible vectors. Restore the "
+              "original embedder, or rebuild the index from scratch at the new "
+              "width."
+        )
+
     await backend.ensure_index(embedder.dimensions)
     if hasattr(backend, "set_embedding_provider"):
         backend.set_embedding_provider(embedder.name)

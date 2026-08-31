@@ -497,10 +497,29 @@ either alone.
 vectors of different widths is meaningless, so [`LocalHybridStore.ensure_index`](../src/rag/store/local.py)
 warns and **discards every stored vector** when the dimension changes — keeping
 them would silently yield nonsense similarities. Changing embedding model or
-dimension therefore means re-embedding the entire corpus. At startup the
-embedding probe reports the model's *true* width and overrides the configured
-value, so a misconfigured `AZURE_OPENAI_EMBEDDING_DIMENSIONS` cannot quietly
-build a broken index.
+dimension therefore means re-embedding the entire corpus.
+
+**With `RETRIEVER_BACKEND=azure` a width disagreement is fatal at boot.**
+The local store can self-heal by dropping its vectors, but a remote index cannot
+— its vector field is immutable, and the app has no way to know it should not be
+querying. So [`rag.startup`](../src/rag/startup.py) reads the width the index
+*actually* declares and compares it against the live embedder; on disagreement it
+logs both widths, the reason the embedder is what it is, and the remedy. By
+default (`STARTUP_FAIL_MODE=unready`) the process then stays up but fails
+readiness, so it takes no traffic while `/health` serves the full diagnosis —
+including the step-by-step `embedding_decision` trace. `crash` exits at boot
+instead, which is safer but leaves no replica, and therefore no `/health` and no
+log stream, at precisely the moment the reason is wanted. The check is
+deliberately about **width agreement, not fallback
+detection**: the local hashing embedder against Azure AI Search is a perfectly
+consistent (if low-quality) configuration when the same embedder wrote the index,
+which is exactly what the offline stub suite exercises. What is never valid is
+mixing widths.
+
+Note that the embedding probe cannot serve as this guard. It measures width by
+calling `embed()`, which *sends* `dimensions` for `text-embedding-3-*` models —
+so it receives back whatever it asked for and can never contradict the configured
+value.
 
 #### Query routing — not implemented
 

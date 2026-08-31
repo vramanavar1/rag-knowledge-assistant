@@ -39,6 +39,10 @@ from rag.store.base import (
 log = get_logger(__name__)
 
 UPLOAD_BATCH = 100
+# Named once because two things must agree on it: the field this store *creates*
+# in `_index_definition`, and the field `vector_width` reads back to check what
+# the index actually holds. A literal in both places is a silent trap.
+VECTOR_FIELD = "content_vector"
 VECTOR_PROFILE = "hnsw-profile"
 VECTOR_ALGORITHM = "hnsw-config"
 SEMANTIC_CONFIG = "default-semantic"
@@ -70,6 +74,9 @@ class AzureAISearchStore:
         self._api = settings.search_api_version
         self._client = make_client(settings, timeout_s=60.0)
         self._dimensions = settings.aoai_embedding_dimensions
+        # The width the index *really* has, read back from its definition. None
+        # until first asked; 0 once asked and the index does not exist.
+        self._vector_width: int | None = None
         self._embedding_provider = ""
         self._semantic_enabled = settings.search_semantic
         self._semantic_failed = False
@@ -135,7 +142,7 @@ class AzureAISearchStore:
                 {"name": "source_path", "type": "Edm.String", "filterable": True},
                 {"name": "token_estimate", "type": "Edm.Int32"},
                 {
-                    "name": "content_vector",
+                    "name": VECTOR_FIELD,
                     "type": "Collection(Edm.Single)",
                     "searchable": True,
                     "retrievable": False,
@@ -176,8 +183,64 @@ class AzureAISearchStore:
             },
         }
 
+    async def vector_width(self) -> int:
+        """Width of `content_vector` as the live index declares it, or 0.
+
+        Read from the index definition rather than from settings, because the
+        question this answers is "what did whoever ingested actually use?" --
+        which configuration cannot know.
+
+        **This never raises.** It is called during startup, and an index it
+        cannot read is a reason to skip the width check -- not a reason to take
+        the container down. Raising here meant a 403 from a stale search key, or
+        one transient network blip at boot, turned into a restart loop with no
+        live replica to attach a log stream to. Whatever went wrong is logged and
+        surfaces on the next real query, exactly as it did before this check
+        existed.
+        """
+        if self._vector_width is not None:
+            return self._vector_width
+
+        self._vector_width = 0          # cached even on failure: retrying per
+                                        # probe would hammer a broken service
+        try:
+            response = await self._client.request(
+                "GET", self._url(f"/indexes/{self._index}"), headers=self._headers
+            )
+        except Exception as exc:                                # noqa: BLE001
+            log.error(
+                "could not reach Azure AI Search to read the index definition; "
+                "the embedding width check is skipped",
+                index=self._index, error=f"{type(exc).__name__}: {exc}"[:400],
+            )
+            return 0
+
+        if response.status_code == 404:
+            log.info("azure ai search index does not exist yet", index=self._index)
+            return 0
+        if response.status_code != 200:
+            log.error(
+                "could not read the index definition; the embedding width check "
+                "is skipped",
+                index=self._index, status=response.status_code,
+                error=response.text[:400],
+                hint="403 usually means AZURE_SEARCH_API_KEY is wrong or lacks "
+                     "rights on this index",
+            )
+            return 0
+
+        fields = response.json().get("fields", [])
+        self._vector_width = next(
+            (int(f.get("dimensions") or 0)
+             for f in fields if f.get("name") == VECTOR_FIELD),
+            0,
+        )
+        return self._vector_width
+
     async def ensure_index(self, dimensions: int) -> None:
         self._dimensions = dimensions
+        # The definition is about to change, so anything read earlier is stale.
+        self._vector_width = None
         definition = self._index_definition(dimensions)
         # PUT is create-or-update and is idempotent, which is what we want on
         # every ingest run.
@@ -431,6 +494,13 @@ class AzureAISearchStore:
         ``full=True`` adds the facet query that yields document and table counts,
         and is for ingest reporting and startup — once, not per probe.
         """
+        # The index's real width, not the configured one. Reporting config here
+        # meant /health would confirm whatever the operator had set even when the
+        # index disagreed -- corroborating the wrong answer during exactly the
+        # investigation /health exists to shorten. Memoised, so this costs one
+        # request for the life of the process, not one per probe.
+        width = await self.vector_width()
+
         try:
             counted = await self._request(
                 "GET", f"/indexes/{self._index}/docs/$count"
@@ -445,7 +515,7 @@ class AzureAISearchStore:
                 chunks=chunks,
                 documents=0,
                 documents_exact=False,      # not computed, not zero
-                dimensions=self._dimensions,
+                dimensions=width,
                 embedding_provider=self._embedding_provider,
                 profile=self._settings.profile,
                 extra={
@@ -480,7 +550,7 @@ class AzureAISearchStore:
             chunks=chunks,
             documents=documents,
             documents_exact=exact,
-            dimensions=self._dimensions,
+            dimensions=width,
             embedding_provider=self._embedding_provider,
             profile=self._settings.profile,
             extra={

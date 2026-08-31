@@ -30,9 +30,16 @@ ARG PYTHON_VERSION=3.14
 # ---------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS deps
 
+# PIP_PROGRESS_BAR=off is about the *log*, not the build. pip draws its progress
+# bar with U+2501 (heavy horizontal), and a build log carrying that character
+# kills `az acr build` on a default Windows console -- cp437/cp1252 cannot encode
+# it, so the CLI's log printer raises UnicodeEncodeError and the command appears
+# to fail while the ACR task is still happily running. Plain ASCII output costs
+# nothing here and cannot trip any console.
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_ROOT_USER_ACTION=ignore
+    PIP_ROOT_USER_ACTION=ignore \
+    PIP_PROGRESS_BAR=off
 
 WORKDIR /app
 COPY requirements.txt ./

@@ -39,7 +39,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from rag.config import Settings
 from rag.models import content_fingerprint
@@ -57,9 +57,26 @@ AZURE_BATCH_SIZE = 16
 class EmbeddingProvider(Protocol):
     name: str
     dimensions: int
+    # Empty when the configured provider is live. Otherwise it names *why* this
+    # is the fallback, in the operator's terms ("missing AZURE_OPENAI_API_KEY"),
+    # so a startup contract failure can quote the cause rather than leaving it
+    # in a log line the reader has to go and find.
+    fallback_reason: str
+    # Ordered record of how this provider was chosen. Surfaced on /health, so it
+    # must never carry a secret -- see `_redact`.
+    decision_trace: list[dict[str, Any]]
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         ...
+
+
+def _redact(value: str) -> str:
+    """Render a secret as evidence of itself, never as itself."""
+    if not value:
+        return "<EMPTY>"
+    if len(value) < 16:
+        return f"<set len={len(value)}>"
+    return f"<set len={len(value)} sha256:{content_fingerprint(value)[:8]}>"
 
 
 # --------------------------------------------------------------------------
@@ -72,8 +89,10 @@ class LocalEmbedder:
 
     name = "local-hashing"
 
-    def __init__(self, dimensions: int = 768) -> None:
+    def __init__(self, dimensions: int = 768, fallback_reason: str = "") -> None:
         self.dimensions = dimensions
+        self.fallback_reason = fallback_reason
+        self.decision_trace: list[dict[str, Any]] = []
 
     @staticmethod
     def _hash(token: str) -> tuple[int, float]:
@@ -133,7 +152,10 @@ class AzureOpenAIEmbedder:
         self._settings = settings
         self.deployment = settings.aoai_embedding_deployment
         self.dimensions = settings.aoai_embedding_dimensions
+        self._explicit_dimensions = settings.aoai_embedding_dimensions_explicit
         self.name = f"azure-openai:{self.deployment}"
+        self.fallback_reason = ""       # this *is* the configured provider
+        self.decision_trace: list[dict[str, Any]] = []
         self._client = make_client(settings, timeout_s=60.0)
         # Created lazily: a Semaphore binds to the running loop, and providers
         # are constructed before one exists (CLI, scripts, FastAPI import time).
@@ -152,6 +174,12 @@ class AzureOpenAIEmbedder:
             f"?api-version={self._settings.aoai_api_version}"
         )
 
+    # Same URL, exposed for diagnostics. Safe to log and to return from /health:
+    # the api-key travels in a header, so nothing secret appears here.
+    @property
+    def probe_url(self) -> str:
+        return self._url
+
     async def _post(self, payload: dict) -> dict:
         headers = {
             "api-key": self._settings.aoai_api_key,
@@ -163,10 +191,30 @@ class AzureOpenAIEmbedder:
         )
         return response.json()
 
+    async def probe_native_width(self) -> int:
+        """The model's own vector width, measured without asking for one.
+
+        Deliberately omits `dimensions`. Measuring through `embed()` -- which
+        sends the configured width -- meant the probe received back exactly what
+        it had asked for, so it could never contradict a misconfigured value. It
+        was measuring its own input.
+        """
+        async with self._semaphore():
+            data = await self._post({"input": ["probe"]})
+        vectors = data.get("data") or []
+        return len(vectors[0]["embedding"]) if vectors else 0
+
     async def _embed_batch(self, batch: list[str]) -> list[list[float]]:
         payload: dict = {"input": batch}
-        # text-embedding-3-* support shortening; older models reject the field.
-        if "text-embedding-3" in self.deployment:
+        # Send the width only when one was explicitly configured, and let Azure
+        # judge whether the model accepts it.
+        #
+        # This used to test `"text-embedding-3" in self.deployment` -- inferring
+        # a *model* capability from a *deployment label* the operator chose. That
+        # is wrong in both directions: a deployment named `vsquare-embeddings`
+        # running text-embedding-3-small never received the field, while one
+        # named `text-embedding-3-small` running ada-002 received it and 400'd.
+        if self._explicit_dimensions:
             payload["dimensions"] = self.dimensions
 
         async with self._semaphore():
@@ -218,6 +266,11 @@ class CachedEmbedder:
         self._path = cache_path
         self.name = inner.name
         self.dimensions = inner.dimensions
+        # Forwarded, not recomputed: the wrapper must be indistinguishable from
+        # what it wraps to anything inspecting the provider -- the startup
+        # contract check sees only this object.
+        self.fallback_reason = getattr(inner, "fallback_reason", "")
+        self.decision_trace = getattr(inner, "decision_trace", [])
         self._cache: dict[str, list[float]] = {}
         self._dirty = False
         self._load()
@@ -277,18 +330,31 @@ class CachedEmbedder:
 # --------------------------------------------------------------------------
 
 
-async def _probe(embedder: AzureOpenAIEmbedder) -> int | None:
-    """Return the model's true vector width, or None if it is unreachable."""
+async def _probe(embedder: AzureOpenAIEmbedder) -> tuple[int | None, str]:
+    """Return the model's true vector width, and why it failed if it did.
+
+    The reason travels back with the result rather than only reaching the log:
+    the startup contract check quotes it, and an operator reading
+    "embedder fell back: probe failed: 404 DeploymentNotFound" needs no second
+    source.
+    """
     try:
-        vector = await embedder.embed(["probe"])
-        return len(vector[0]) if vector and vector[0] else None
+        width = await embedder.probe_native_width()
+        return (width or None), ""
     except Exception as exc:
-        log.warning(
+        # Not truncated to a couple of hundred characters any more: Azure's
+        # body carries the `code` ("DeploymentNotFound", "invalid_api_key") that
+        # *is* the diagnosis, and cutting it short has cost real debugging time.
+        detail = f"{type(exc).__name__}: {exc}"[:800]
+        log.error(
             "Azure OpenAI embedding deployment unavailable, using local embedder",
             deployment=embedder.deployment,
-            error=str(exc)[:200],
+            # The URL carries the deployment name and api-version -- the two
+            # things most often wrong -- and never the key, which is a header.
+            url=embedder.probe_url,
+            error=detail,
         )
-        return None
+        return None, f"probe failed for deployment '{embedder.deployment}': {detail}"
 
 
 async def get_embedding_provider(
@@ -300,13 +366,39 @@ async def get_embedding_provider(
     constructor cannot await.
     """
     provider: EmbeddingProvider = LocalEmbedder()
+    reason = ""
+
+    # An ordered record of how this decision was reached, logged step by step and
+    # carried on the provider for /health. The branch structure below is short,
+    # but reconstructing which arm ran from a 500 three layers away is not -- so
+    # it states each step as it takes it.
+    trace: list[dict[str, Any]] = []
+
+    def step(name: str, result: str, **fields: Any) -> None:
+        entry = {"step": len(trace) + 1, "name": name, "result": result, **fields}
+        trace.append(entry)
+        log.info("embedding decision", **entry)
 
     credentials = bool(settings.aoai_endpoint and settings.aoai_api_key
                        and settings.aoai_embedding_deployment)
 
+    step(
+        "credentials",
+        "complete" if credentials else "incomplete",
+        endpoint=settings.aoai_endpoint or "<unset>",
+        api_key=_redact(settings.aoai_api_key),
+        deployment=settings.aoai_embedding_deployment or "<unset>",
+    )
+    step(
+        "enabled",
+        "proceed" if settings.aoai_enabled else "blocked",
+        azure_openai_enabled=settings.aoai_enabled,
+    )
+
     if credentials and not settings.aoai_enabled:
         # Same gate as the chat provider: inherited credentials must not turn a
         # "local" run into a billed cloud one without an explicit opt-in.
+        reason = "AZURE_OPENAI_ENABLED is not true (credentials are present)"
         log.warning(
             "Azure OpenAI embedding credentials are present but "
             "AZURE_OPENAI_ENABLED is not set, so the local embedder is used",
@@ -315,17 +407,25 @@ async def get_embedding_provider(
         )
     elif credentials:
         candidate = AzureOpenAIEmbedder(settings)
-        actual = await _probe(candidate)
+        actual, probe_error = await _probe(candidate)
         if actual:
-            # The probe reports the model's true width; trust it over the config.
+            step("probe", "ok", url=candidate.probe_url, native_width=actual)
             if actual != candidate.dimensions:
-                log.info(
-                    "embedding dimension corrected from probe",
-                    configured=candidate.dimensions,
-                    actual=actual,
-                )
-                candidate.dimensions = actual
+                if candidate._explicit_dimensions:
+                    # An explicit width is a deliberate truncation request, so it
+                    # stands -- but say both numbers, because a width that does
+                    # not match the index is the failure this whole path exists
+                    # to make visible.
+                    step("width", "configured overrides native",
+                         configured=candidate.dimensions, native=actual)
+                else:
+                    step("width", "adopted from model",
+                         was=candidate.dimensions, now=actual)
+                    candidate.dimensions = actual
             provider = candidate
+        else:
+            reason = probe_error or "embedding probe returned no vector"
+            step("probe", "FAILED", url=candidate.probe_url, error=reason)
     else:
         # Name the settings that are actually absent rather than guessing at one.
         # The expensive case is *partial* configuration -- endpoint and deployment
@@ -339,14 +439,27 @@ async def get_embedding_provider(
             ("AZURE_OPENAI_API_KEY", settings.aoai_api_key),
             ("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", settings.aoai_embedding_deployment),
         ) if not value]
-        log.info(
+        reason = f"missing {', '.join(missing)}"
+        # ERROR, not INFO: with RETRIEVER_BACKEND=azure this is very often the
+        # cause of a width mismatch that stops the app booting, and it needs to
+        # be findable in the log without knowing what to grep for.
+        log.error(
             "falling back to the local embedder",
             missing=",".join(missing),
             hint=f"set {' and '.join(missing)} to use Azure embeddings",
         )
 
+    if reason:
+        provider = LocalEmbedder(fallback_reason=reason)
+        step("fallback", "local-hashing",
+             width=provider.dimensions, reason=reason)
+
+    step("result", provider.name, width=provider.dimensions)
+    provider.decision_trace = trace
+
     log.info("embedding provider active", provider=provider.name,
-             dimensions=provider.dimensions)
+             dimensions=provider.dimensions,
+             fallback_reason=provider.fallback_reason)
 
     if cached:
         return CachedEmbedder(provider, settings.embedding_cache_path())

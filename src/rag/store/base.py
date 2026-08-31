@@ -97,6 +97,17 @@ class SearchBackend(Protocol):
     async def ensure_index(self, dimensions: int) -> None:
         """Create or update the index definition. Idempotent."""
 
+    async def vector_width(self) -> int:
+        """Width of the vectors *actually stored*, or 0 when unknown.
+
+        Deliberately not derived from configuration: the whole point is to
+        detect the case where the index was built by a different embedder than
+        the one now querying it, and a configured value cannot see that.
+
+        0 means "no opinion" -- an empty index, or one that does not exist yet.
+        Callers must treat that as "cannot check", never as a mismatch.
+        """
+
     async def upsert(self, chunks: list[Chunk], vectors: list[list[float]]) -> int:
         """Insert or replace chunks by ``chunk_id``. Idempotent."""
 

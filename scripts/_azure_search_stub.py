@@ -21,6 +21,7 @@ only on the outcome.
 Only the surface the adapter actually calls is implemented:
 
     PUT  /indexes/{name}                  create or update the index definition
+    GET  /indexes/{name}                  read it back (the stored vector width)
     POST /indexes/{name}/docs/index       mergeOrUpload / merge / delete actions
     POST /indexes/{name}/docs/search      search, vectorQueries, filter, facets
     GET  /indexes/{name}/docs/$count      document count
@@ -275,6 +276,17 @@ class AzureSearchStub:
                 # /indexes/{name}
                 if match := re.fullmatch(r"/indexes/([^/]+)", path):
                     name = match.group(1)
+                    if method == "GET":
+                        # Read back the definition, which is how the adapter
+                        # learns the width the index was actually built with.
+                        # A 404 here is meaningful, not incidental: the adapter
+                        # treats it as "no index yet" and reports width 0.
+                        index = stub.indexes.get(name)
+                        if index is None:
+                            self._send(404, {"error": {"message": "no such index"}})
+                            return
+                        self._send(200, index.definition)
+                        return
                     if method != "PUT":
                         self._send(405, {"error": {"message": "method not allowed"}})
                         return

@@ -4,13 +4,22 @@ One ``Settings`` object, built once at import of ``get_settings()``.  Every
 Azure-dependent value is optional: when a credential is missing the matching
 provider degrades to a local implementation and logs which one is live, so a
 demo can never silently answer from a fallback the operator did not expect.
+
+**One exception, and only one.** With ``RETRIEVER_BACKEND=azure`` the index is a
+remote artifact of a fixed vector width, so degrading the *embedder* can produce
+a combination that cannot serve a correct answer at all. ``rag.startup`` checks
+that at boot and refuses to start rather than failing on the first question.
+Everything else, and every local path, degrades exactly as described above.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from rag.models import content_fingerprint
 
 try:  # optional convenience; the app works fine without a .env file
     from dotenv import load_dotenv
@@ -23,7 +32,29 @@ except Exception:  # pragma: no cover - dotenv is optional
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+# Every variable the helpers below are asked for, recorded as a side effect of
+# reading it. A hand-kept list would drift from the reads the first time someone
+# adds a setting; this cannot, because adding an `_env(...)` call *is* the
+# registration. Reset at the top of `_load()` so `get_settings(refresh=True)`
+# rebuilds rather than accumulating stale entries.
+_ENV_READS: dict[str, dict[str, object]] = {}
+
+
+def _record(name: str, default: object) -> None:
+    raw = os.getenv(name)
+    _ENV_READS[name] = {
+        # `present` and the value are tracked separately: a variable set to the
+        # empty string is a different diagnosis from one never set at all, and
+        # a Key Vault secretref that fails to resolve produces exactly the
+        # former while looking correct in the portal.
+        "present": raw is not None,
+        "raw": raw or "",
+        "default": str(default).lower() if isinstance(default, bool) else str(default),
+    }
+
+
 def _env(name: str, default: str = "") -> str:
+    _record(name, default)
     return (os.getenv(name) or default).strip()
 
 
@@ -32,6 +63,10 @@ def _env_int(name: str, default: int) -> int:
         return int(_env(name) or default)
     except ValueError:
         return default
+    finally:
+        # `_env` above recorded its own empty default; correct it to the typed
+        # one so the report shows the value that actually applies when unset.
+        _record(name, default)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -39,13 +74,70 @@ def _env_float(name: str, default: float) -> float:
         return float(_env(name) or default)
     except ValueError:
         return default
+    finally:
+        _record(name, default)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = _env(name).lower()
+    _record(name, default)
     if not raw:
         return default
     return raw in {"1", "true", "yes", "on"}
+
+
+# Matched against the variable *name*, so a secret is redacted even when its
+# value looks innocuous. Verified against the current set: catches
+# AZURE_OPENAI_API_KEY, AZURE_SEARCH_API_KEY and
+# APPLICATIONINSIGHTS_CONNECTION_STRING, with no false positives among the rest.
+_SECRET_RE = re.compile(
+    r"KEY|SECRET|TOKEN|PASSWORD|CONNECTION_STRING|CREDENTIAL|SAS", re.IGNORECASE
+)
+
+# Below this length a truncated SHA-256 is worth guessing offline, so short
+# secrets get a length and nothing else. An 8-hex prefix of a 32-char Azure key
+# leaks nothing practical; the same prefix of a 6-char password does.
+_FINGERPRINT_MIN_LEN = 16
+
+
+def redacted_env() -> dict[str, str]:
+    """Every variable `_load()` read, with secret values never rendered.
+
+    Unset variables are included deliberately. A missing variable simply does
+    not appear in a raw ``os.environ`` dump, and "never configured" -- or a
+    secretref that resolved to nothing -- is the failure this report exists to
+    catch.
+
+    Redaction does not depend on ``SHOW_ENV_VALUES``: ``/health`` carries no auth
+    dependency, so the flag gates whether the block appears at all, never
+    whether a secret is visible.
+    """
+    report: dict[str, str] = {}
+
+    for name in sorted(_ENV_READS):
+        read = _ENV_READS[name]
+        default = str(read["default"])
+
+        if not read["present"]:
+            report[name] = f"<UNSET> (default: {default})" if default else "<UNSET>"
+            continue
+
+        # Stripped to match what `_env` itself returns, so the report shows the
+        # value the app is actually using -- whitespace-only reads as empty.
+        value = str(read["raw"]).strip()
+
+        if not value:
+            report[name] = "<EMPTY>"
+        elif _SECRET_RE.search(name):
+            if len(value) >= _FINGERPRINT_MIN_LEN:
+                report[name] = (f"<set len={len(value)} "
+                                f"sha256:{content_fingerprint(value)[:8]}>")
+            else:
+                report[name] = f"<set len={len(value)}>"
+        else:
+            report[name] = value
+
+    return report
 
 
 @dataclass
@@ -60,6 +152,10 @@ class Settings:
     aoai_utility_deployment: str = ""
     aoai_embedding_deployment: str = ""
     aoai_embedding_dimensions: int = 1536
+    # Whether a width was *asked for*, as opposed to defaulted. Only an explicit
+    # request is sent to Azure; otherwise the model returns its native width and
+    # the probe can measure it honestly.
+    aoai_embedding_dimensions_explicit: bool = False
 
     # ---- TLS (for networks that intercept HTTPS) --------------------------
     azure_ca_bundle: str = ""
@@ -96,6 +192,14 @@ class Settings:
     log_level: str = "INFO"
     log_format: str = "json"
     appinsights_connection_string: str = ""
+    # Adds the redacted env report to /health. Off by default: it is a
+    # troubleshooting aid, not something to leave on a public endpoint.
+    show_env_values: bool = False
+    # What to do when the startup contract is violated. `unready` keeps the
+    # process alive but fails readiness, so the diagnosis is reachable over HTTP;
+    # `crash` exits at boot, which is safer but leaves nothing to interrogate --
+    # no replica means no /health and no log stream.
+    startup_fail_mode: str = "unready"
 
     # ---- API --------------------------------------------------------------
     allowed_origins: list[str] = field(default_factory=lambda: ["http://localhost:8000"])
@@ -151,6 +255,10 @@ class Settings:
 def _load() -> Settings:
     s = Settings()
 
+    # Rebuilt from scratch each load, so `get_settings(refresh=True)` reports the
+    # current environment rather than merging it with the previous one.
+    _ENV_READS.clear()
+
     s.aoai_enabled = _env_bool("AZURE_OPENAI_ENABLED", False)
     s.aoai_endpoint = _env("AZURE_OPENAI_ENDPOINT").rstrip("/")
     s.aoai_api_key = _env("AZURE_OPENAI_API_KEY")
@@ -162,6 +270,11 @@ def _load() -> Settings:
     s.aoai_utility_deployment = _env("AZURE_OPENAI_UTILITY_DEPLOYMENT")
     s.aoai_embedding_deployment = _env("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
     s.aoai_embedding_dimensions = _env_int("AZURE_OPENAI_EMBEDDING_DIMENSIONS", 1536)
+    # Read straight from the environment, not via `_env`, which would re-record
+    # the variable with an empty default and corrupt the SHOW_ENV_VALUES report.
+    s.aoai_embedding_dimensions_explicit = bool(
+        (os.getenv("AZURE_OPENAI_EMBEDDING_DIMENSIONS") or "").strip()
+    )
 
     s.azure_ca_bundle = _env("AZURE_CA_BUNDLE")
     s.azure_use_system_certs = _env_bool("AZURE_USE_SYSTEM_CERTS", False)
@@ -195,10 +308,19 @@ def _load() -> Settings:
     s.log_level = _env("LOG_LEVEL", "INFO").upper()
     s.log_format = _env("LOG_FORMAT", "json").lower()
     s.appinsights_connection_string = _env("APPLICATIONINSIGHTS_CONNECTION_STRING")
+    s.show_env_values = _env_bool("SHOW_ENV_VALUES", False)
+    s.startup_fail_mode = _env("STARTUP_FAIL_MODE", "unready").lower()
 
     origins = _env("API_ALLOWED_ORIGINS")
     if origins:
         s.allowed_origins = [o.strip() for o in origins.split(",") if o.strip()]
+
+    # Read here for the report only. `auth.py` reads API_ALLOW_ANONYMOUS itself,
+    # per-request via os.getenv, and keeps doing so -- routing it through
+    # Settings would move the read to load time and change when a change to it
+    # takes effect. It is recorded because a report that omits the switch
+    # governing anonymous access is a poor troubleshooting aid.
+    _record("API_ALLOW_ANONYMOUS", True)
 
     return s
 

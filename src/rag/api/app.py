@@ -19,7 +19,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -195,6 +195,11 @@ async def health() -> JSONResponse:
     A probe that returns 200 because the process is up would let an instance
     with an empty index take traffic and answer every question with
     "I don't know".
+
+    Setting ``SHOW_ENV_VALUES=true`` adds an ``env`` block listing every
+    variable the app reads, including ones that are unset -- which is what makes
+    a missing or unresolved setting visible. Secret values are always redacted
+    to a length and hash fingerprint, whether or not the flag is on.
     """
     report = await get_service().health()
     code = (status.HTTP_200_OK if report["status"] == "ready"
@@ -209,6 +214,19 @@ async def chat(
 ) -> ChatResponse:
     """Answer a question, grounded in the documents this caller may read."""
     service = get_service()
+
+    # Refuse rather than attempt. Without this the request reaches the retriever
+    # and dies deep in the search backend on a vector-length mismatch -- a 500
+    # naming neither the cause nor the fix. 503 is the honest code: the service
+    # is configured in a way it cannot serve.
+    if service.startup_errors:
+        first = service.startup_errors[0]
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(f"{first['check']}: {first['reason']}. Fix: {first['fix']}. "
+                    f"See /health for the full startup report."),
+        )
+
     history = [Turn(role=t.role, content=t.content) for t in request.history]
 
     answer = await service.ask(

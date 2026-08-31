@@ -155,6 +155,11 @@ class LocalHybridStore:
             self._vectors.clear()
         self._dimensions = dimensions
 
+    async def vector_width(self) -> int:
+        # Loaded from the index file, so it reflects what is stored rather than
+        # what is configured. 0 on a fresh store that has never been ingested.
+        return self._dimensions
+
     def set_embedding_provider(self, name: str) -> None:
         self._embedding_provider = name
 
