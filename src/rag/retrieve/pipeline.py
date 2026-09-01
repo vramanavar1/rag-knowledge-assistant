@@ -28,7 +28,7 @@ from rag.providers.llm import ChatProvider
 from rag.retrieve.condense import condense_query
 from rag.retrieve.decompose import decompose_query
 from rag.retrieve.recency import apply_version_ranking, prefilter_superseded
-from rag.retrieve.rerank import rerank
+from rag.retrieve.rerank import calibrate_scores, rerank
 from rag.store.base import MODE_HYBRID, MODE_VECTOR, SearchBackend, SearchFilters
 
 log = get_logger(__name__)
@@ -221,6 +221,12 @@ class Retriever:
                 candidates, subqueries, len(candidates)
             )
             candidates, method = await rerank(standalone, candidates, self._llm)
+            # Put every reranker on the same axis before anything downstream
+            # reads the number. Without this, `min_relevance` and `confidence`
+            # mean something different depending on which reranker happened to
+            # be reachable -- which is how the same corpus scored 0.9 locally
+            # and 0.67 in production. The raw score survives on `rerank_raw`.
+            calibrate_scores(candidates, method)
             st["method"] = method
             trace["rerank_method"] = method
 

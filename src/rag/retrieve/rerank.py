@@ -149,6 +149,59 @@ def _is_degenerate(hits: list[Hit]) -> bool:
     return bool(hits) and all((h.rerank_score or 0.0) <= 0.0 for h in hits)
 
 
+# --------------------------------------------------------------------------
+# Cross-reranker calibration
+# --------------------------------------------------------------------------
+#
+# All three rerankers report "0-10", and none of them mean the same thing by it.
+# Measured over `eval/dataset.jsonl`, the lexical scorer puts a *correct* answer
+# between 4.4 and 8.5. An LLM asked to score 0-10 anchors high and uses 8-10.
+# Azure's L2 reranker returns 0-4 -- where ~2.0 already means relevant and 4 is
+# effectively unreachable -- which this store rescales by 2.5, so a good Azure
+# match arrives here around 4.0-7.0.
+#
+# `min_relevance` and `compute_confidence` consume that single number, so the
+# same answer scored 0.9 on one reranker and 0.67 on another purely because the
+# rulers differ. These bands map each reranker's own (weak, strong) range onto a
+# shared axis so the downstream numbers finally mean one thing.
+#
+# The low end of every band maps to `_CALIBRATED_WEAK`, which is the default
+# `min_relevance`. That is deliberate and load-bearing: the mapping is monotonic
+# and fixes the floor in place, so **calibration cannot change what abstains**.
+# It only changes how the space *above* the floor is used.
+_CALIBRATED_WEAK = 4.0
+_CALIBRATED_STRONG = 9.0
+
+CALIBRATION_BANDS: dict[str, tuple[float, float]] = {
+    "llm": (4.0, 9.0),                              # already uses the full range
+    "lexical": (4.0, 8.5),                          # measured, 16 answered cases
+    "lexical-after-degenerate-llm": (4.0, 8.5),
+    "azure-semantic": (4.0, 7.0),                   # Azure raw 1.6-2.8, x2.5
+}
+
+
+def calibrate(method: str, score: float) -> float:
+    """Map one reranker's score onto the shared relevance axis."""
+    band = CALIBRATION_BANDS.get(method)
+    if band is None:
+        return score
+    weak, strong = band
+    if strong <= weak:
+        return score
+    ratio = (score - weak) / (strong - weak)
+    scaled = _CALIBRATED_WEAK + ratio * (_CALIBRATED_STRONG - _CALIBRATED_WEAK)
+    return round(max(0.0, min(10.0, scaled)), 3)
+
+
+def calibrate_scores(hits: list[Hit], method: str) -> None:
+    """Calibrate in place, preserving the raw score for diagnostics."""
+    for hit in hits:
+        if hit.rerank_score is None:
+            continue
+        hit.rerank_raw = hit.rerank_score
+        hit.rerank_score = calibrate(method, hit.rerank_score)
+
+
 async def rerank(query: str, hits: list[Hit], llm: ChatProvider) -> tuple[list[Hit], str]:
     """Rerank candidates, returning ``(hits, method_used)``."""
     candidates = hits[:MAX_CANDIDATES]

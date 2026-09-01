@@ -136,6 +136,10 @@ class Hit:
     keyword_score: float | None = None
     rrf_score: float | None = None
     rerank_score: float | None = None
+    # What the reranker actually returned, before per-method calibration. Kept
+    # because the calibrated number is comparable across rerankers while the raw
+    # one is what you check against the reranker's own documentation.
+    rerank_raw: float | None = None
     recency_boost: float = 0.0
     matched_subquery: str | None = None
 

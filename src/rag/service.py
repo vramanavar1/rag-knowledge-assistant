@@ -69,7 +69,11 @@ def _trail_hits(hits: list[Any], *, with_text: bool) -> list[dict[str, Any]]:
             "keyword_score": h.keyword_score,
             "rrf_score": h.rrf_score,
             # None here across every row is the answer to "did the reranker run?"
+            # `rerank_score` is calibrated so it is comparable across rerankers;
+            # `rerank_raw` is what the reranker itself returned, which is what
+            # you check against Azure's 0-4 scale or the LLM's 0-10.
             "rerank_score": h.rerank_score,
+            "rerank_raw": h.rerank_raw,
             "recency_boost": h.recency_boost,
             "score": round(h.score, 4),
             "matched_subquery": h.matched_subquery,

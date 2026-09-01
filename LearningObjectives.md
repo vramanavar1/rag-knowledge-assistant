@@ -705,13 +705,30 @@ confidence = 0.45 · min(1, top_score / 10)      retrieval strength
 `top_score` and `second` are the **final** scores of hits 1 and 2 — where
 `final = rerank_score + recency_boost`, which is **not** capped at 10.
 
+**`rerank_score` is calibrated before it reaches this formula.** The three
+rerankers all report "0-10" and none mean the same thing by it: measured over
+`eval/dataset.jsonl` the lexical scorer puts a correct answer between 4.4 and
+8.5; an LLM asked for 0-10 anchors high and uses 8-10; Azure's L2 reranker
+returns 0-4, where ~2.0 already means relevant and 4 is effectively unreachable.
+Feeding those straight into one formula meant **the same corpus scored 0.9 on a
+local LLM-reranked run and 0.67 in production on Azure** — a ruler change, not a
+quality change. [`calibrate`](src/rag/retrieve/rerank.py) maps each reranker's
+own range onto a shared axis first; `rerank_raw` in the answer trail preserves
+what the reranker actually said.
+
+The mapping fixes `min_relevance` in place — every band's low end maps to exactly
+4.0 — so **calibration cannot change what abstains.** Verified: the same 16 of 20
+eval questions are answered before and after, while mean confidence moves 0.754 →
+0.771.
+
 **Worked example.** *"What is the nightly hotel cap in London?"* against
-`Finance/TravelPolicy.docx` returns `confidence = 0.736`. Retrieval is correct —
+`Finance/TravelPolicy.docx` returns `confidence = 0.753` (calibrated; it was
+0.736 before per-reranker calibration). Retrieval is correct —
 the top hit is the 214-character tier table containing `London → $350` — yet the
 number looks unremarkable. The diagram shows why, and what can be done about it:
 
 ```
-                     confidence = 0.736          target: > 0.90
+                     confidence = 0.753          target: > 0.90
                                 │
    ┌────────────┬───────────────┴───────────────┬────────────────┐
    │            │                               │                │
@@ -763,7 +780,7 @@ and `margin` improve at once rather than independently.
 
 | Scenario | top | #2 | retrieval | margin | Confidence |
 |---|---|---|---|---|---|
-| today (`lexical`) | 6.0 | 4.25 | 0.270 | 0.066 | **0.736** |
+| today (`lexical`, calibrated 6.22) | 6.22 | 4.28 | 0.280 | 0.073 | **0.753** |
 | better reranker, modest gap | 8.5 | 6.0 | 0.383 | 0.094 | 0.876 |
 | better reranker, clear gap | 9.0 | 5.0 | 0.405 | 0.150 | **0.955** |
 | decisive | 10.0 | 5.0 | 0.450 | 0.150 | **1.000** |
