@@ -1784,6 +1784,7 @@ the app runs fully locally and says so.
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | — | Reserved; the exporter is a stub |
 | `SHOW_ENV_VALUES` | `false` | Adds a redacted `env` block to `/health`. See below |
 | `STARTUP_FAIL_MODE` | `unready` | What a violated startup contract does. `unready`: stay up, fail readiness, report at `/health`. `crash`: exit at boot |
+| `LOG_ANSWER_TRAIL` | `false` | Adds the question, answer and chunk snippets to the per-request `answer trail` log line. Scores and document ids are logged regardless — §8 |
 
 **`STARTUP_FAIL_MODE` — refusing to serve, two ways.** With
 `RETRIEVER_BACKEND=azure` the app checks at boot that the embedder's vector width
@@ -1975,6 +1976,121 @@ az containerapp logs show -g $ResourceGroup -n ca-rag-assistant --follow   # liv
 
 `--tail` is capped at 300 lines and reads only the running replica, which is
 enough while reproducing a fault but not for anything historical.
+
+#### The full answer trail for one correlation id
+
+Every question writes one `answer trail` line carrying what the request actually
+did. **Application Insights has none of this** — the exporter is a stub, so the
+route is Log Analytics over container stdout, and these queries are how you read
+it.
+
+```kusto
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == "ca-rag-assistant"
+| extend d = parse_json(Log_s)
+| where tostring(d.correlation_id) == "<paste-the-id>"
+| where tostring(d.message) == "answer trail"
+| project TimeGenerated,
+          question      = d.question,            // needs LOG_ANSWER_TRAIL
+          standalone    = d.standalone_query,
+          status        = d.status,
+          confidence    = d.confidence,
+          groundedness  = d.groundedness,
+          stale_source  = d.grounded_in_superseded,
+          rerank_method = d.rerank_method,       // azure-semantic | llm | lexical
+          cited         = d.cited_docs,
+          versioning    = d.versioning,
+          total_ms      = d.total_ms,
+          answer        = d.answer               // needs LOG_ANSWER_TRAIL
+```
+
+**Every retrieved chunk, every score, and its currency:**
+
+```kusto
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == "ca-rag-assistant"
+| extend d = parse_json(Log_s)
+| where tostring(d.correlation_id) == "<paste-the-id>"
+| where tostring(d.message) == "answer trail"
+| mv-expand hit = d.hits
+| project doc_id     = tostring(hit.doc_id),
+          section    = tostring(hit.section_path),
+          department = tostring(hit.department),
+          vector     = todouble(hit.vector_score),
+          keyword    = todouble(hit.keyword_score),
+          rrf        = todouble(hit.rrf_score),
+          rerank     = todouble(hit.rerank_score),
+          recency    = todouble(hit.recency_boost),
+          final      = todouble(hit.score),
+          current    = tobool(hit.is_current),
+          version    = tostring(hit.version),
+          snippet    = tostring(hit.snippet)     // needs LOG_ANSWER_TRAIL
+| order by final desc
+```
+
+`rerank` null on every row answers **"was the reranker applied at all?"**;
+`rerank_method` names which one ran. The scores are kept separate rather than
+fused precisely so "which signal put this chunk on top?" has an answer.
+
+#### Truthfulness is three questions, and only two are answerable here
+
+| | Answerable at runtime | Field |
+|---|---|---|
+| **Groundedness** — is every claim supported by the retrieved context? | yes | `groundedness`, `groundedness_method`, `citations_valid` |
+| **Source currency** — was the answer built on a *current* document? | yes | `grounded_in_superseded`, per-hit `is_current` / `version` |
+| **Correctness** — is the answer actually *true*? | **no** | needs ground truth — `python eval/run_eval.py` |
+
+The middle one is the trap groundedness alone will not catch: **a perfectly
+grounded answer can still be false** if it faithfully quotes a superseded
+document. `grounded_in_superseded` is scoped to the documents actually **cited**,
+because retrieval routinely turns up an older version and demotes it — that is
+the version ranking working, not a fault.
+
+**Correctness, "did we retrieve the right document", and response completeness
+all need labels** and belong to `eval/run_eval.py`, which scores 35 labelled
+questions for hit@1, hit@5, MRR, document recall, citation precision and
+groundedness. Runtime logging says what happened for *this* user; the eval
+harness says whether the system is right in general. Keeping them apart is what
+stops a confident number appearing with nothing behind it.
+
+#### Alerting — log-search rules, not App Insights
+
+```kusto
+// answered from a superseded document, when the user did NOT ask for history.
+// The wants_history guard matters: a question about 2025 SHOULD cite the 2025 doc.
+ContainerAppConsoleLogs_CL
+| extend d = parse_json(Log_s)
+| where tostring(d.message) == "answer trail"
+| where tobool(d.grounded_in_superseded)
+| where not(tobool(d.versioning.wants_history))
+| summarize stale = count() by bin(TimeGenerated, 1h)
+```
+
+```kusto
+// grounding falling, or abstention climbing
+ContainerAppConsoleLogs_CL
+| extend d = parse_json(Log_s)
+| where tostring(d.message) == "answer trail"
+| summarize avg_groundedness = avg(todouble(d.groundedness)),
+            abstained = countif(tostring(d.status) != "answered"),
+            n = count()
+        by bin(TimeGenerated, 15m)
+| where avg_groundedness < 0.5 or todouble(abstained) / n > 0.3
+```
+
+```kusto
+// the reranker or the embedder silently changed underneath you
+ContainerAppConsoleLogs_CL
+| extend d = parse_json(Log_s)
+| where tostring(d.message) == "answer trail"
+| summarize count() by bin(TimeGenerated, 1h),
+            rerank = tostring(d.rerank_method),
+            embedder = tostring(d.providers.embeddings)
+```
+
+That last one is worth wiring up first: it reports `embedder=local-hashing` the
+moment a fallback happens, which is the failure this deployment spent a long time
+diagnosing from a vector-length error three layers away.
 
 **For history, or to search by id — Log Analytics.** Do not paste a table name
 from memory: **which table holds these logs depends on how the environment was

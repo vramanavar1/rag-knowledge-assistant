@@ -19,6 +19,7 @@ in the repository — each item linked to its evidence, each marked honestly.
 - [6. Capabilities](#6-capabilities)
 - [7. Debugging Process](#7-debugging-process)
 - [8. Query Resolution & Evaluation Metrics](#8-query-resolution--evaluation-metrics)
+- [9. Tracing a Live Query](#9-tracing-a-live-query)
 - [Summary](#summary)
 
 ## Status key
@@ -366,8 +367,16 @@ into `Settings` and consumed by nothing — there is no exporter (note ⁵ of
 - if the caller kept the response body, you have everything;
 - if not, you have the log stream, and only for as long as it is retained.
 
-Until an exporter exists, the cheap mitigation is to have the chat client retain
-`X-Correlation-Id` alongside any answer a user reports.
+**The log-stream half of that was aspirational until recently.** The per-stage
+trace and per-hit scores were assembled in `ask()` and returned in the response,
+never written to stdout — which is why the table below lists only *incidental*
+lines. `ask()` now also emits a single `answer trail` line carrying the whole
+trace, the scored hits and their version currency, so a correlation id is
+answerable from Log Analytics alone.
+[§9](#9-tracing-a-live-query) has the queries.
+
+Until an exporter exists, the cheap mitigation is still to have the chat client
+retain `X-Correlation-Id` alongside any answer a user reports.
 
 **Then grep the logs for that correlation id.** These lines each change the
 diagnosis:
@@ -575,7 +584,10 @@ condense → decompose → embed → search → version_filter → rerank → ve
 Per-stage timings and their own fields sit alongside — `decompose.subqueries` as
 a count, `version_filter.*`, `rerank.method`, `version_rank.*`. The whole trace is
 on by default (`include_trace`) and, as [§7](#7-debugging-process) records, it
-lives in the response body and the log stream and **nowhere else**.
+lives in the response body and the log stream and **nowhere else** — Application
+Insights receives nothing. Every field in this table is now also written to the
+`answer trail` log line, which is what makes it recoverable from a correlation id
+after the fact: [§9](#9-tracing-a-live-query).
 
 ### 8.4 — Azure RAG evaluation metrics, side by side
 
@@ -680,6 +692,177 @@ by [`compute_confidence`](src/rag/generate/guardrails.py).
 
 ---
 
+## 9. Tracing a Live Query
+
+§8 asks *"is the system right in general?"* and answers it offline, against
+labels. This section asks the other question, the one that arrives as a support
+ticket: **a user reports a bad answer and gives you a correlation id — what can
+you actually recover?**
+
+### 9.1 — What one correlation id yields
+
+Every question writes a single `answer trail` line to stdout, which is the only
+route into Log Analytics. It carries what the request did:
+
+```
+status, confidence, cache, total_ms, hit_count,
+groundedness, groundedness_method, citations_valid,
+rerank_method, versioning{explicit_year, wants_history, boosted, demoted},
+grounded_in_superseded, cited_docs,
+stages[] with per-stage timings, tokens, llm_calls, embedding_calls, providers,
+hits[]: chunk_id, doc_id, department, section_path,
+        is_current, version, effective_date,
+        vector_score, keyword_score, rrf_score, rerank_score,
+        recency_boost, score, matched_subquery
+```
+
+**The split is deliberate.** Scores, document ids and version currency are
+operational data and are logged always. The question, the answer and chunk
+snippets are *user content* and require `LOG_ANSWER_TRAIL=true` — turned on to
+investigate, off again afterwards.
+
+**Application Insights still receives none of this.**
+`APPLICATIONINSIGHTS_CONNECTION_STRING` is read into `Settings` and consumed by
+nothing; there is no `opentelemetry` or `azure-monitor` dependency (note ⁵ of
+[Capabilities](#6-capabilities)). Log Analytics over container stdout is the
+whole story, which is why the answer below is a query rather than a portal blade.
+
+### 9.2 — The queries
+
+**Request-level verdicts:**
+
+```kusto
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == "ca-rag-assistant"
+| extend d = parse_json(Log_s)
+| where tostring(d.correlation_id) == "<paste-the-id>"
+| where tostring(d.message) == "answer trail"
+| project TimeGenerated,
+          question      = d.question,            // needs LOG_ANSWER_TRAIL
+          standalone    = d.standalone_query,
+          status        = d.status,
+          confidence    = d.confidence,
+          groundedness  = d.groundedness,
+          stale_source  = d.grounded_in_superseded,
+          rerank_method = d.rerank_method,       // azure-semantic | llm | lexical
+          cited         = d.cited_docs,
+          versioning    = d.versioning,
+          total_ms      = d.total_ms,
+          answer        = d.answer               // needs LOG_ANSWER_TRAIL
+```
+
+**Every retrieved chunk, every score, and its currency:**
+
+```kusto
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == "ca-rag-assistant"
+| extend d = parse_json(Log_s)
+| where tostring(d.correlation_id) == "<paste-the-id>"
+| where tostring(d.message) == "answer trail"
+| mv-expand hit = d.hits
+| project doc_id     = tostring(hit.doc_id),
+          section    = tostring(hit.section_path),
+          department = tostring(hit.department),
+          vector     = todouble(hit.vector_score),
+          keyword    = todouble(hit.keyword_score),
+          rrf        = todouble(hit.rrf_score),
+          rerank     = todouble(hit.rerank_score),
+          recency    = todouble(hit.recency_boost),
+          final      = todouble(hit.score),
+          current    = tobool(hit.is_current),
+          version    = tostring(hit.version)
+| order by final desc
+```
+
+**Why the scores stay separate rather than fused.** `rerank` null on every row
+answers *"was the reranker applied at all?"*, and `rerank_method` names which of
+the three produced them — i.e. **which scale the numbers are on**, the same point
+[§8.3](#83--where-each-decision-lands-in-the-trace) makes about the trace. A
+single fused score cannot answer either question.
+
+### 9.3 — Which of §8.4's evaluators this answers
+
+[§8.4](#84--azure-rag-evaluation-metrics-side-by-side) maps Azure AI Foundry's
+RAG evaluators onto this repo's offline metrics. Here is the runtime counterpart
+— what a live correlation id can and cannot tell you:
+
+| §8.4 evaluator | From one correlation id? | Field, or why not |
+|---|---|---|
+| `builtin.groundedness` | ✅ | `groundedness`, `groundedness_method`, `citations_valid` |
+| `builtin.groundedness_pro` | ✅ | `unsupported_figures`, `unsupported_claims` |
+| `builtin.retrieval` (ordering) | ⚠️ partly | every per-chunk score is present, so *bad ordering* is visible; whether it was **the right passage** is not |
+| `builtin.document_retrieval` | ❌ | needs relevance labels — `doc_recall`, `ndcg@3` come from [`eval/dataset.jsonl`](eval/dataset.jsonl) |
+| `builtin.relevance` | ❌ | LLM-judged query-vs-response; nothing computes it in the request path |
+| `builtin.response_completeness` | ❌ | needs ground truth; `key_facts_missing` is offline only |
+| **source currency** | ✅ — **and Azure has no evaluator for it** | `grounded_in_superseded`, per-hit `is_current` / `version` |
+
+**That last row is the point of this section.** Groundedness asks *"is the answer
+supported by the context it was given?"* — it cannot ask whether that context was
+still true. **A perfectly grounded answer can be false**, if it faithfully quotes
+a rate card that has since been superseded. None of the built-in evaluators look
+for this; this repo already detects it (`prefilter_superseded`,
+`apply_version_ranking`, [§8.3](#83--where-each-decision-lands-in-the-trace)'s
+`versioning` block), and the trail now surfaces it per request.
+
+`grounded_in_superseded` is scoped to the documents actually **cited**, and the
+distinction matters. Verified on both sides:
+
+| Question | Retrieved | Cited | Flag |
+|---|---|---|---|
+| *"What is the 2026 pricing rate card?"* | `Pricing2025.pdf` at `is_current: false`, demoted `recency_boost: -1.0` | `Pricing2026.pdf` | **false** — version ranking working as designed |
+| *"What were the 2025 list prices before the increase?"* | same document, boosted `+3.0` because `wants_history: true` | `Pricing2025.pdf` | **true** — and legitimately so |
+
+Retrieval routinely surfaces an older version and demotes it; that is not a
+fault. Only a *cited* stale document is a truthfulness signal.
+
+### 9.4 — Alerting
+
+Log-search alert rules over the same table — no exporter required:
+
+```kusto
+// answered from a superseded document, when the user did NOT ask for history
+ContainerAppConsoleLogs_CL
+| extend d = parse_json(Log_s)
+| where tostring(d.message) == "answer trail"
+| where tobool(d.grounded_in_superseded)
+| where not(tobool(d.versioning.wants_history))
+| summarize stale = count() by bin(TimeGenerated, 1h)
+```
+
+The `wants_history` guard is not optional — as the table above shows, a question
+*about* 2025 **should** cite the 2025 document. Without it the rule fires on
+every correct historical answer.
+
+```kusto
+// the reranker or the embedder silently changed underneath you
+ContainerAppConsoleLogs_CL
+| extend d = parse_json(Log_s)
+| where tostring(d.message) == "answer trail"
+| summarize count() by bin(TimeGenerated, 1h),
+            rerank = tostring(d.rerank_method),
+            embedder = tostring(d.providers.embeddings)
+```
+
+This one is worth wiring first. It reports `embedder=local-hashing` the moment a
+fallback happens — the failure mode [§5](#5-rag-failure-scenarios) describes,
+which otherwise surfaces as a vector-length error three layers away from its
+cause.
+
+### 9.5 — Status
+
+⚠️ **Partial.** The `answer trail` line is implemented in
+[`service.py`](src/rag/service.py) and verified locally: with the flag off and
+on, on an abstention (no citations, so no false stale flag), and on both the
+historical and current forms of a versioned question.
+
+The **KQL is documented, not executed** — it targets a Log Analytics workspace
+this work has not run against, the same caveat everything from §6.2 onward
+carries in [`Deployment.md`](Deployment.md). And Application Insights remains
+unwired, so the ⚠️ on the observability row in [§6](#6-capabilities) stands
+unchanged: this improves what is *queryable*, not what is *exported*.
+
+---
+
 ## Summary
 
 | Deliverable | Status |
@@ -689,7 +872,7 @@ by [`compute_confidence`](src/rag/generate/guardrails.py).
 | 3. Evaluation Results | ✅ Done |
 | 4. Demo + Presentation Video | 🔲 TO DO |
 
-Sections 5–8 are supporting analysis rather than items the brief asked for — the failure write-ups, the bonus-capability audit, the debugging runbook and the query-resolution/metrics map. The brief lists four deliverables, which is why this table has four rows.
+Sections 5–9 are supporting analysis rather than items the brief asked for — the failure write-ups, the bonus-capability audit, the debugging runbook, the query-resolution/metrics map and the live-query trace. The brief lists four deliverables, which is why this table has four rows.
 
 **The two partial items are both about live Azure resources, not about code.**
 The Azure AI Search client and the Azure OpenAI embedding client are written and

@@ -12,8 +12,14 @@ These spans are *shaped* for Application Insights -- one correlation id per
 request, one timed span per stage -- but **no exporter is wired up yet**.
 ``APPLICATIONINSIGHTS_CONNECTION_STRING`` is read into ``Settings`` and is not
 consumed by anything; sending this data anywhere means adding an exporter
-(OpenTelemetry or the Azure Monitor SDK) and a dependency to match. Until then
-the trace reaches you through the log stream and the response body only.
+(OpenTelemetry or the Azure Monitor SDK) and a dependency to match.
+
+The trace reaches you two ways, and neither is Application Insights. It is
+returned in the response body, and ``AssistantService.ask`` writes it to stdout
+as a single ``answer trail`` line -- which is the only route into Log Analytics,
+and therefore the only thing a KQL query over a correlation id can find. Scores,
+document ids and version currency go on every line; the question and the answer
+need ``LOG_ANSWER_TRAIL=true``, because they are user content.
 """
 
 from __future__ import annotations

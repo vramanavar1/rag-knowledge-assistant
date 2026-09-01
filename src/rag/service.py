@@ -34,6 +34,51 @@ log = get_logger(__name__)
 
 _WHITESPACE = re.compile(r"\s+")
 
+# Bounds for the text the trail carries. One line per question lands in Log
+# Analytics, and the corpus should not be duplicated there chunk by chunk.
+_TRAIL_TEXT_CHARS = 500
+_TRAIL_SNIPPET_CHARS = 200
+
+
+def _clip(text: str, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _trail_hits(hits: list[Any], *, with_text: bool) -> list[dict[str, Any]]:
+    """One compact record per retrieved chunk.
+
+    Every score is kept separate rather than fused, because the questions this
+    exists to answer are "was the reranker applied at all?" and "which signal
+    put this chunk on top?" -- neither is answerable from a single number.
+    """
+    records = []
+    for h in hits:
+        c = h.chunk
+        record: dict[str, Any] = {
+            "chunk_id": c.chunk_id,
+            "doc_id": c.doc_id,
+            "department": c.department,
+            "section_path": c.section_path,
+            # Currency travels with the scores: an answer can be perfectly
+            # grounded and still wrong if its source has been superseded.
+            "is_current": c.is_current,
+            "version": c.version,
+            "effective_date": c.effective_date,
+            "vector_score": h.vector_score,
+            "keyword_score": h.keyword_score,
+            "rrf_score": h.rrf_score,
+            # None here across every row is the answer to "did the reranker run?"
+            "rerank_score": h.rerank_score,
+            "recency_boost": h.recency_boost,
+            "score": round(h.score, 4),
+            "matched_subquery": h.matched_subquery,
+        }
+        if with_text:
+            record["snippet"] = _clip(c.text, _TRAIL_SNIPPET_CHARS)
+        records.append(record)
+    return records
+
 
 class AnswerCache:
     """Small LRU over single-turn questions.
@@ -178,7 +223,7 @@ class AssistantService:
                 trace["cache"] = "hit"
                 trace["total_ms"] = round((time.perf_counter() - started) * 1000, 1)
                 log.info("answer served from cache", question=question)
-                return Answer(
+                served = Answer(
                     text=cached.text,
                     status=cached.status,
                     citations=cached.citations,
@@ -189,6 +234,11 @@ class AssistantService:
                     clarification_options=cached.clarification_options,
                     trace=trace,
                 )
+                # A cached answer is still an answer someone received, so it
+                # gets a trail too -- `cache: "hit"` distinguishes it. Omitting
+                # it would leave gaps in the record for the most-asked questions.
+                self._log_answer_trail(question, served)
+                return served
 
         outcome = await self.retriever.retrieve(question, history, principal)
         answer = await self.generator.generate(question, outcome, history, principal)
@@ -211,12 +261,67 @@ class AssistantService:
             }
         )
 
+        self._log_answer_trail(question, answer)
+
         # Only cache outcomes that are stable. A clarification depends on what
         # the user says next, and an abstention may be fixed by re-ingesting.
         if allow_cache and answer.status == "answered":
             self.cache.put(cache_key, answer)
 
         return answer
+
+    def _log_answer_trail(self, question: str, answer: Answer) -> None:
+        """One structured line carrying the whole story of this request.
+
+        Everything here was already computed and returned in the response body;
+        it simply never reached stdout, which is the only route to Log Analytics.
+        Without it a correlation id yields the `request` line and nothing about
+        why the answer came out the way it did.
+        """
+        trace = answer.trace or {}
+        grounded = trace.get("groundedness") or {}
+        cited_docs = {c.doc_id for c in answer.citations if hasattr(c, "doc_id")}
+
+        fields: dict[str, Any] = {
+            "status": answer.status,
+            "confidence": round(answer.confidence, 3),
+            "cache": trace.get("cache"),
+            "total_ms": trace.get("total_ms"),
+            "hit_count": len(answer.hits),
+            "rerank_method": trace.get("rerank_method"),
+            "versioning": trace.get("versioning"),
+            "groundedness": grounded.get("score"),
+            "groundedness_method": grounded.get("method"),
+            "citations_valid": grounded.get("citations_valid"),
+            # The truthfulness signal groundedness alone cannot give: a faithful
+            # answer drawn from a superseded document is still wrong.
+            #
+            # Scoped to *cited* documents on purpose. Retrieval routinely turns
+            # up an older version and demotes it -- that is the version ranking
+            # working, not a fault. And with no citations there is nothing the
+            # answer was grounded in, so an abstention that happened to retrieve
+            # a stale chunk must not raise this flag.
+            "grounded_in_superseded": any(
+                not h.chunk.is_current
+                for h in answer.hits if h.chunk.doc_id in cited_docs
+            ),
+            "cited_docs": sorted(cited_docs),
+            "stages": trace.get("stages"),
+            "tokens": trace.get("tokens"),
+            "llm_calls": trace.get("llm_calls"),
+            "embedding_calls": trace.get("embedding_calls"),
+            "providers": trace.get("providers"),
+            "hits": _trail_hits(answer.hits,
+                                with_text=self.settings.log_answer_trail),
+        }
+
+        if self.settings.log_answer_trail:
+            fields["question"] = _clip(question, _TRAIL_TEXT_CHARS)
+            fields["standalone_query"] = answer.standalone_query
+            fields["subqueries"] = answer.subqueries
+            fields["answer"] = _clip(answer.text, _TRAIL_TEXT_CHARS)
+
+        log.info("answer trail", **fields)
 
     # ------------------------------------------------------------------
 

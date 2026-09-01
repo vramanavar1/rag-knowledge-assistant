@@ -195,6 +195,11 @@ class Settings:
     # Adds the redacted env report to /health. Off by default: it is a
     # troubleshooting aid, not something to leave on a public endpoint.
     show_env_values: bool = False
+    # Adds the question, the answer and chunk snippets to the per-request
+    # "answer trail" log line. Off by default: scores, document ids and currency
+    # flags are operational data and are always logged, but the question and the
+    # answer are user content and belong behind a switch.
+    log_answer_trail: bool = False
     # What to do when the startup contract is violated. `unready` keeps the
     # process alive but fails readiness, so the diagnosis is reachable over HTTP;
     # `crash` exits at boot, which is safer but leaves nothing to interrogate --
@@ -309,6 +314,7 @@ def _load() -> Settings:
     s.log_format = _env("LOG_FORMAT", "json").lower()
     s.appinsights_connection_string = _env("APPLICATIONINSIGHTS_CONNECTION_STRING")
     s.show_env_values = _env_bool("SHOW_ENV_VALUES", False)
+    s.log_answer_trail = _env_bool("LOG_ANSWER_TRAIL", False)
     s.startup_fail_mode = _env("STARTUP_FAIL_MODE", "unready").lower()
 
     origins = _env("API_ALLOWED_ORIGINS")
