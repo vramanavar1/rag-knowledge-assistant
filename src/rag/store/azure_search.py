@@ -21,6 +21,8 @@ portal and the docs show, which makes the index definition easy to audit.
 
 from __future__ import annotations
 
+import re
+import time
 from typing import Any
 
 from rag.config import Settings
@@ -55,6 +57,25 @@ FACET_LIMIT = 1000
 # 0-10, including the abstention threshold, so scores are rescaled on the way in.
 _SEMANTIC_SCALE = 2.5
 
+# Azure's own wording when the service cannot do semantic ranking at all. Every
+# failed search arrives as the same RuntimeError, so without matching on the
+# message there is no way to tell "this tier has no semantic ranker" from "this
+# one query was malformed" -- and mistaking the second for the first disables a
+# working feature. A vector-dimension mismatch was reported as a missing SKU for
+# exactly this reason.
+_SEMANTIC_UNAVAILABLE = re.compile(
+    r"semantic (search|ranking) is not enabled"
+    r"|semantic[^.]{0,40}not (supported|available)"
+    r"|requires[^.]{0,40}(basic|standard) (tier|sku)",
+    re.I,
+)
+
+# How long to stay on plain hybrid after a genuine semantic failure. Deliberately
+# not permanent: a tier upgrade or a transient outage should heal on its own,
+# where a process-lifetime flag needs a revision restart nobody thinks to do.
+# The cost of being wrong is one failed request per interval.
+SEMANTIC_RETRY_SECONDS = 900.0
+
 _SELECT_FIELDS = (
     "chunk_id,doc_id,ordinal,title,section_path,content,content_type,department,"
     "doc_type,version,effective_date,is_current,page,source_path,token_estimate"
@@ -79,9 +100,15 @@ class AzureAISearchStore:
         self._vector_width: int | None = None
         self._embedding_provider = ""
         self._semantic_enabled = settings.search_semantic
-        self._semantic_failed = False
+        # Monotonic deadline before semantic is retried; 0.0 means "active now".
+        self._semantic_retry_at = 0.0
 
     # ------------------------------------------------------------------
+
+    @property
+    def _semantic_active(self) -> bool:
+        """Configured on, and not inside a back-off window."""
+        return self._semantic_enabled and time.monotonic() >= self._semantic_retry_at
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -430,8 +457,7 @@ class AzureAISearchStore:
             ]
 
         use_semantic = (
-            self._semantic_enabled
-            and not self._semantic_failed
+            self._semantic_active
             and mode in (MODE_HYBRID, MODE_KEYWORD)
         )
         if use_semantic:
@@ -443,22 +469,28 @@ class AzureAISearchStore:
                 "POST", f"/indexes/{self._index}/docs/search", payload
             )
         except RuntimeError as exc:
-            if use_semantic:
-                # Semantic ranking needs Basic tier or above. Degrade once,
-                # loudly, and keep serving on plain hybrid.
-                log.warning(
-                    "semantic ranking unavailable, continuing without it "
-                    "(requires Basic SKU or higher)",
-                    error=str(exc)[:200],
-                )
-                self._semantic_failed = True
-                payload.pop("queryType", None)
-                payload.pop("semanticConfiguration", None)
-                result = await self._request(
-                    "POST", f"/indexes/{self._index}/docs/search", payload
-                )
-            else:
+            # Only Azure saying semantic is unavailable disables semantic.
+            # Anything else -- a malformed query, a vector-width mismatch, a
+            # throttle -- would fail the retry identically, so retrying costs a
+            # second doomed request and the warning names the wrong cause.
+            # Re-raising surfaces the real error on the first attempt.
+            if not (use_semantic and _SEMANTIC_UNAVAILABLE.search(str(exc))):
                 raise
+
+            # Report what Azure said rather than asserting why. The previous
+            # message claimed "requires Basic SKU or higher" without checking,
+            # which sent a vector-dimension bug to the wrong department.
+            log.warning(
+                "semantic ranking unavailable, continuing on plain hybrid",
+                error=str(exc)[:400],
+                retry_in_s=SEMANTIC_RETRY_SECONDS,
+            )
+            self._semantic_retry_at = time.monotonic() + SEMANTIC_RETRY_SECONDS
+            payload.pop("queryType", None)
+            payload.pop("semanticConfiguration", None)
+            result = await self._request(
+                "POST", f"/indexes/{self._index}/docs/search", payload
+            )
 
         return [self._to_hit(row) for row in (result or {}).get("value", [])]
 
@@ -520,7 +552,7 @@ class AzureAISearchStore:
                 profile=self._settings.profile,
                 extra={
                     "index": self._index,
-                    "semantic": self._semantic_enabled and not self._semantic_failed,
+                    "semantic": self._semantic_active,
                 },
             )
 
@@ -555,7 +587,7 @@ class AzureAISearchStore:
             profile=self._settings.profile,
             extra={
                 "index": self._index,
-                "semantic": self._semantic_enabled and not self._semantic_failed,
+                "semantic": self._semantic_active,
                 "table_chunks": table_chunks,
             },
         )

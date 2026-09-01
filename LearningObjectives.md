@@ -690,6 +690,127 @@ of the three rerankers produced it, and `confidence` on every response is the
 blend of retrieval strength, margin, groundedness and citation validity computed
 by [`compute_confidence`](src/rag/generate/guardrails.py).
 
+#### Which levers actually move confidence
+
+That blend is a weighted sum, and the weights decide where effort is worth
+spending. They are not documented anywhere else in this repository:
+
+```
+confidence = 0.45 · min(1, top_score / 10)      retrieval strength
+           + 0.15 · clamp((top − second) / 4)   margin over the runner-up
+           + 0.30 · groundedness                0.0 – 1.0
+           + 0.10 · (citations_valid ? 1 : 0)
+```
+
+`top_score` and `second` are the **final** scores of hits 1 and 2 — where
+`final = rerank_score + recency_boost`, which is **not** capped at 10.
+
+**Worked example.** *"What is the nightly hotel cap in London?"* against
+`Finance/TravelPolicy.docx` returns `confidence = 0.736`. Retrieval is correct —
+the top hit is the 214-character tier table containing `London → $350` — yet the
+number looks unremarkable. The diagram shows why, and what can be done about it:
+
+```
+                     confidence = 0.736          target: > 0.90
+                                │
+   ┌────────────┬───────────────┴───────────────┬────────────────┐
+   │            │                               │                │
+retrieval    margin                       groundedness       citations
+ w = 0.45    w = 0.15                       w = 0.30          w = 0.10
+min(1,top/10) clamp(Δ/4)                     0.0 – 1.0          0 or 1
+   │            │                               │                │
+ 6.0/10       1.75/4                           1.0              true
+ = 0.600      = 0.438                          = 1.0            = 1.0
+   │            │                               │                │
+ → 0.270      → 0.066                         → 0.300          → 0.100
+   │            │                               │                │
+▲ SCOPE      ▲ SCOPE                        ■ AT MAX         ■ AT MAX
+  +0.180       +0.084                        no headroom      no headroom
+   │            │
+   └─────┬──────┘   both are functions of ONE number
+         ▼
+   rerank_score = 6.0        ← set by rerank_method
+         │
+   ┌─────┴──────────────────────────┬─────────────────────────────┐
+   │                                │                             │
+lexical (now)                  llm_rerank                  azure-semantic
+0–10, term overlap             0–10, model-scored          0–4 ×2.5 → 0–10
+capped at 6.00 here            BLOCKED: AOAI 403           needs Basic SKU +
+                               (VNet rule)                 SEMANTIC=true, AND
+                                                           can be disabled at
+                                                           runtime by a failure
+   │                                │                             │
+   │                                └──────────────┬──────────────┘
+   │                                               ▼
+   │                                    rerank_score 8.5 – 10
+   │                                    confidence 0.85 – 1.00  ✔
+   ▼
+ ✗ DEAD END — chunking the table
+   bare row 2.50 (worse) · row+header 6.00 (no change)
+   MAX_TABLE_CHARS = 3000 is already correct for a 214-char table
+```
+
+**Two of the four terms are already at maximum.** Groundedness is 1.0 and the
+citations are valid — 0.40 of the 0.60 the grounding half can ever contribute.
+No change to the corpus, the answer prompt or the verifier will move them,
+because there is nothing left to move. **All remaining headroom (+0.264) sits in
+`retrieval` and `margin`, and both are functions of `rerank_score`** — so there
+is one lever here, not four.
+
+The two move together, which is what makes the lever effective: a reranker that
+raises the top score usually also opens the gap to the runner-up, so `retrieval`
+and `margin` improve at once rather than independently.
+
+| Scenario | top | #2 | retrieval | margin | Confidence |
+|---|---|---|---|---|---|
+| today (`lexical`) | 6.0 | 4.25 | 0.270 | 0.066 | **0.736** |
+| better reranker, modest gap | 8.5 | 6.0 | 0.383 | 0.094 | 0.876 |
+| better reranker, clear gap | 9.0 | 5.0 | 0.405 | 0.150 | **0.955** |
+| decisive | 10.0 | 5.0 | 0.450 | 0.150 | **1.000** |
+
+`margin` saturates once the gap reaches 4 points, so a reranker that is merely
+*confident* about the right chunk already collects the full 0.15.
+
+**Why 6.00 exactly, and why chunking cannot fix it.** `lexical_rerank` scores
+`10 · (0.7 · body_coverage + 0.3 · heading_coverage)`. The query's content terms
+are `night`, `hotel`, `cap`, `london` — and **`hotel` never appears in the table
+body.** It is in the section heading *"4. Hotel Accommodations"*, which carries
+0.3 weight over a denominator of all four terms:
+
+| Chunking | body | heading | score |
+|---|---|---|---|
+| **Whole table** (current) | 3/4 | 1/4 | **6.00 / 10** |
+| Bare row, no header | 1/4 | 1/4 | **2.50 / 10** |
+| Row + repeated header, as [`_split_table`](src/rag/ingest/chunker.py) does | 3/4 | 1/4 | **6.00 / 10** |
+
+Splitting the table either halves the score or changes nothing — `$350` without
+its `Nightly Cap` column header means nothing, which is why the chunker keeps
+tables whole below `MAX_TABLE_CHARS`.
+
+**So the action is to stop falling back to `lexical`.** Ranked:
+
+1. **Unblock Azure OpenAI.** `llm_rerank` scores 0–10 directly and would rate a
+   table that literally answers the question far above the prose around it,
+   lifting *both* retrieval and margin. It is unreachable while the resource's
+   VNet rule returns 403 — the same fault that forces the local embedder, so one
+   fix closes two problems.
+2. **Enable Azure semantic ranking — and check it has not switched *itself*
+   off.** Independent of Azure OpenAI: Basic SKU or above plus
+   `AZURE_SEARCH_SEMANTIC=true`, and purpose-built for a short factual question
+   against a small table. But configuration is not the only way to lose it:
+   `AzureAISearchStore` degrades to plain hybrid when a semantic query fails, so
+   a service with semantic enabled can still report `rerank_method: lexical`.
+   That degrade used to be triggered by **any** search error and to last for the
+   life of the process — so the 768/1536 vector mismatch above disabled semantic
+   ranking as a side effect. It now fires only on Azure's own "semantic … not
+   enabled" wording and expires after `SEMANTIC_RETRY_SECONDS`. `/health` →
+   `index.semantic` reports the live state.
+3. **Leave `lexical_rerank` alone.** Its `heading_coverage` denominator is every
+   query term, so a three-word heading can never score well — that is what caps
+   this case. But it is the *fallback*. Retuning it would raise the number
+   without improving retrieval, and would hide that the intended reranker is not
+   running.
+
 ---
 
 ## 9. Tracing a Live Query
