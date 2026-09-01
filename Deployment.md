@@ -2207,15 +2207,98 @@ $WorkspaceId = az containerapp env show -g $ResourceGroup -n cae-rag-prod `
 az monitor log-analytics query -w $WorkspaceId --analytics-query "<the KQL above>" -o table
 ```
 
-**What the traceback usually says here.** A non-2xx from Azure AI Search becomes
-a `RuntimeError` in [`store/azure_search.py`](src/rag/store/azure_search.py), and
-the retrieval fan-out does not swallow it — so it surfaces as exactly this 500:
+**What the traceback usually says here.** A non-2xx from any Azure endpoint
+becomes an `AzureEndpointError` (a `RuntimeError` subclass) from
+[`providers/http.py`](src/rag/providers/http.py), and the retrieval fan-out does
+not swallow it — so it surfaces as exactly this 500. Every such error carries a
+`category` field, which is the fastest way to sort it:
 
-| In the traceback | Means |
+| `category` | Means |
 |---|---|
-| `-> 401` or `-> 403` | The search key is wrong, or was set but the revision never restarted. `az containerapp revision list -g $ResourceGroup -n ca-rag-assistant -o table` |
-| `-> 404 … index … was not found` | Ingestion has not run against this service — §6.3 |
-| Azure OpenAI 401 / `DeploymentNotFound` | `AZURE_OPENAI_API_KEY` missing (§6.6), or a deployment name that does not exist |
+| `unreachable` | No HTTP response at all — DNS, TLS or connect failure. A `CERTIFICATE_VERIFY_FAILED` here is an intercepting proxy: see `AZURE_CA_BUNDLE` in §6.6 |
+| `not_accessible` | We reached the service and it refused us — 401 or 403. Read `hint` to see which of the two 403s it is |
+| `not_found` | 404 — no such deployment or index at this endpoint and api-version |
+| `unavailable` | Retryable status, retries exhausted — throttling or an outage |
+
+| In the log | Means |
+|---|---|
+| Search `not_accessible (HTTP 401)` | The search key is wrong, or was set but the revision never restarted. `az containerapp revision list -g $ResourceGroup -n ca-rag-assistant -o table` |
+| `not_found (HTTP 404)` on Search | Ingestion has not run against this service — §6.3 |
+| Azure OpenAI `not_accessible (HTTP 401)` / `not_found (HTTP 404)` | `AZURE_OPENAI_API_KEY` missing (§6.6), or a deployment name that does not exist |
+| **Azure OpenAI `not_accessible (HTTP 403)`, hint names the *network location*** | **The account's data-plane access rules refused this caller — see below** |
+
+#### An Azure OpenAI 403 that is not about the key
+
+The log headline reads `Azure OpenAI embeddings endpoint not accessible (HTTP
+403)` and the hint names the caller's *network location*. The `azure_message`
+field on the same line carries the service's own sentence:
+
+```
+Access denied due to Virtual Network/Firewall rules.
+```
+
+**Azure sends that sentence whether or not a virtual network exists.** It is the
+one message `networkAcls` and `publicNetworkAccess` share, and it will name a
+VNet on a deployment that has none — this one included. Do not go looking for a
+virtual network; it is why the app's own wording deliberately does not repeat it.
+
+Two settings produce it, neither requiring a VNet:
+
+```bash
+az cognitiveservices account show -n <account> -g $ResourceGroup \
+  --query "{public:properties.publicNetworkAccess, default:properties.networkAcls.defaultAction, ips:properties.networkAcls.ipRules, vnets:properties.networkAcls.virtualNetworkRules}"
+```
+
+- `public: Disabled` — the public endpoint is off entirely.
+- `default: Deny` with entries in `ips` — an IP allow-list. `vnets` is typically `[]`.
+
+The trap is that **it will succeed from your workstation and fail from the app**,
+because a developer IP usually is on that list. A Container Apps environment
+created without `--infrastructure-subnet-resource-id` (§6.4 creates it that way)
+runs in a Microsoft-managed VNet and egresses from a shared regional address that
+is neither stable nor listable — so there is nothing you can safely allow-list.
+Verify from Cloud Shell, not your laptop.
+
+```bash
+az resource update \
+  --ids $(az cognitiveservices account show -n <account> -g $ResourceGroup --query id -o tsv) \
+  --set properties.publicNetworkAccess=Enabled properties.networkAcls.defaultAction=Allow
+```
+
+Portal: the resource → **Resource Management → Networking → Allow access from:
+All networks**. `az cognitiveservices account update` has no `--default-action`
+flag, hence the generic `az resource update`.
+
+Then **restart the revision** — the embedder decision is made once at boot in
+`get_embedding_provider`, and `vector_width()` caches its result even on failure,
+so opening the access rules changes nothing in a running replica.
+
+Two things that look like the fix and are not:
+
+- **Granting `Cognitive Services OpenAI User`** (§6.5). Network access rules are
+  evaluated independently of RBAC, so this 403 survives any role assignment — and
+  the code sends `api-key` headers, not bearer tokens, so the role is unused
+  either way.
+- **Rotating the key.** The credential was never examined; the request was
+  refused before that point. A rejected *key* is a 401, and says so.
+
+The knock-on is larger than the log suggests. The embedding probe fails →
+`LocalEmbedder` at 768 dims → under `RETRIEVER_BACKEND=azure` against a 1536-wide
+index that is a `index_embedder_width_agreement` violation and the replica never
+becomes ready. Chat fails the same way but degrades *silently* to extractive
+answers and lexical reranking. `GET /health` tells both stories at once:
+
+```json
+"providers": {
+  "azure_openai_reachable": false,
+  "embeddings": "local-hashing",
+  "embeddings_fallback_reason": "probe failed for deployment '…': Azure OpenAI embeddings endpoint not accessible (HTTP 403): …"
+}
+```
+
+`azure_openai_reachable` is tri-state — `false` means probed and refused, `null`
+means never attempted (no credentials, or `AZURE_OPENAI_ENABLED` unset), which is
+a normal offline run rather than a fault.
 
 > **Application Insights is not wired up.**
 > `APPLICATIONINSIGHTS_CONNECTION_STRING` is read into `Settings` and consumed by

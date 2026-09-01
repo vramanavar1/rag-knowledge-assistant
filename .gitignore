@@ -19,7 +19,7 @@ venv/
 .mypy_cache/
 prd.md
 errorlog.txt
-Temp.ps1
+Temp*.ps1
 errorlog.txt
 
 # --- build artefacts ---

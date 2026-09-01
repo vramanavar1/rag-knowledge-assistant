@@ -29,7 +29,13 @@ from rag.config import Settings
 from rag.models import Chunk, Hit
 from rag.observability.tracing import get_logger
 from rag.providers.http import aclose as http_aclose
-from rag.providers.http import make_client
+from rag.providers.http import (
+    BODY_BUDGET,
+    AzureEndpointError,
+    classify,
+    headline,
+    make_client,
+)
 from rag.store.base import (
     MODE_HYBRID,
     MODE_KEYWORD,
@@ -127,9 +133,17 @@ class AzureAISearchStore:
         )
         if response.status_code in (200, 201, 204):
             return response.json() if response.content else None
-        raise RuntimeError(
-            f"Azure AI Search {method} {path} -> {response.status_code}: "
-            f"{response.text[:400]}"
+        # Same vocabulary as the Azure OpenAI callers, though this path does not
+        # share their retry helper: a 403 here is just as likely to be the search
+        # service's own network access rules as a wrong key, and the operator
+        # should not have to learn two dialects to find that out.
+        body = response.text[:BODY_BUDGET]
+        category, hint = classify(response.status_code, body)
+        raise AzureEndpointError(
+            f"Azure AI Search {method} {path}",
+            category=category, hint=hint,
+            status=response.status_code, azure_message=body,
+            endpoint=self._url(path),
         )
 
     # ------------------------------------------------------------------
@@ -236,9 +250,12 @@ class AzureAISearchStore:
             )
         except Exception as exc:                                # noqa: BLE001
             log.error(
-                "could not reach Azure AI Search to read the index definition; "
-                "the embedding width check is skipped",
-                index=self._index, error=f"{type(exc).__name__}: {exc}"[:400],
+                "could not read the index definition; the embedding width check "
+                "is skipped",
+                index=self._index,
+                error=headline("Azure AI Search", "unreachable", None),
+                category="unreachable",
+                detail=f"{type(exc).__name__}: {exc}"[:BODY_BUDGET],
             )
             return 0
 
@@ -246,13 +263,19 @@ class AzureAISearchStore:
             log.info("azure ai search index does not exist yet", index=self._index)
             return 0
         if response.status_code != 200:
+            # Reports, never raises -- see the docstring. Only the wording is
+            # shared with the raising paths; the contract is unchanged.
+            body = response.text[:BODY_BUDGET]
+            category, hint = classify(response.status_code, body)
             log.error(
                 "could not read the index definition; the embedding width check "
                 "is skipped",
-                index=self._index, status=response.status_code,
-                error=response.text[:400],
-                hint="403 usually means AZURE_SEARCH_API_KEY is wrong or lacks "
-                     "rights on this index",
+                index=self._index,
+                error=headline("Azure AI Search", category, response.status_code),
+                category=category,
+                status=response.status_code,
+                hint=hint,
+                azure_message=body,
             )
             return 0
 
@@ -474,7 +497,12 @@ class AzureAISearchStore:
             # throttle -- would fail the retry identically, so retrying costs a
             # second doomed request and the warning names the wrong cause.
             # Re-raising surfaces the real error on the first attempt.
-            if not (use_semantic and _SEMANTIC_UNAVAILABLE.search(str(exc))):
+            #
+            # Match on the service's own words specifically: `str(exc)` is now
+            # our vocabulary ("endpoint not accessible"), and the sentence that
+            # decides this branch is Azure's, in `azure_message`.
+            said = getattr(exc, "azure_message", "") or str(exc)
+            if not (use_semantic and _SEMANTIC_UNAVAILABLE.search(said)):
                 raise
 
             # Report what Azure said rather than asserting why. The previous
@@ -482,7 +510,7 @@ class AzureAISearchStore:
             # which sent a vector-dimension bug to the wrong department.
             log.warning(
                 "semantic ranking unavailable, continuing on plain hybrid",
-                error=str(exc)[:400],
+                error=said[:400],
                 retry_in_s=SEMANTIC_RETRY_SECONDS,
             )
             self._semantic_retry_at = time.monotonic() + SEMANTIC_RETRY_SECONDS

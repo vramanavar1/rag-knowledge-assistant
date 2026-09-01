@@ -45,7 +45,7 @@ from rag.config import Settings
 from rag.models import content_fingerprint
 from rag.observability.tracing import get_logger, record_usage
 from rag.providers.http import aclose as http_aclose
-from rag.providers.http import make_client, post_with_retry
+from rag.providers.http import AzureEndpointError, make_client, post_with_retry
 
 log = get_logger(__name__)
 
@@ -341,11 +341,11 @@ async def _probe(embedder: AzureOpenAIEmbedder) -> tuple[int | None, str]:
     try:
         width = await embedder.probe_native_width()
         return (width or None), ""
-    except Exception as exc:
-        # Not truncated to a couple of hundred characters any more: Azure's
-        # body carries the `code` ("DeploymentNotFound", "invalid_api_key") that
-        # *is* the diagnosis, and cutting it short has cost real debugging time.
-        detail = f"{type(exc).__name__}: {exc}"[:800]
+    except AzureEndpointError as exc:
+        # `str(exc)` is already the headline plus the hint, in our own words --
+        # the service's sentence rides along in a separate field rather than in
+        # the reason an operator reads first. See providers/http.py.
+        detail = str(exc)[:800]
         log.error(
             "Azure OpenAI embedding deployment unavailable, using local embedder",
             deployment=embedder.deployment,
@@ -353,6 +353,17 @@ async def _probe(embedder: AzureOpenAIEmbedder) -> tuple[int | None, str]:
             # things most often wrong -- and never the key, which is a header.
             url=embedder.probe_url,
             error=detail,
+            **exc.log_fields(),
+        )
+        return None, f"probe failed for deployment '{embedder.deployment}': {detail}"
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"[:800]
+        log.error(
+            "Azure OpenAI embedding deployment unavailable, using local embedder",
+            deployment=embedder.deployment,
+            url=embedder.probe_url,
+            error=detail,
+            category="unreachable",
         )
         return None, f"probe failed for deployment '{embedder.deployment}': {detail}"
 

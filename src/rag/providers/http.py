@@ -26,6 +26,26 @@ Retries
 Everything else fails fast, because retrying a 401 or a 404 just multiplies the
 latency of a misconfiguration.
 
+Failure vocabulary
+------------------
+Every permanent failure -- from any Azure endpoint, not just this module's two
+callers -- is raised as `AzureEndpointError`, which says what *this process
+observed* rather than repeating what the service guessed the cause was:
+
+    unreachable     no HTTP response at all: DNS, TLS, connect, timeout
+    not_accessible  401/403 -- we reached it and it refused us
+    not_found       404 -- no such deployment or index here
+    unavailable     retryable status, retries exhausted
+
+That distinction is not cosmetic.  Azure OpenAI answers a data-plane access-rule
+rejection with the fixed sentence "Access denied due to Virtual Network/Firewall
+rules." *whether or not a virtual network is involved* -- it is the one message
+`networkAcls` and `publicNetworkAccess` share.  Pasting that into our own error
+text once cost a day of looking for a VNet that did not exist, on a Container
+Apps deployment that has none.  So the service's own words are kept, but demoted
+to the `azure_message` field: still there to quote at support or match against
+the portal, no longer the first thing an operator reads.
+
 Concurrency
 -----------
 The client is ``httpx.AsyncClient``.  Every Azure call in this codebase is
@@ -54,6 +74,115 @@ from rag.observability.tracing import get_logger
 log = get_logger(__name__)
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+# How much of the service's response body to carry on the error. Generous on
+# purpose: the body holds the `code` ("DeploymentNotFound", "invalid_api_key")
+# that *is* the diagnosis. Safe to widen -- credentials travel as headers and
+# never appear in a response body.
+BODY_BUDGET = 700
+
+# Bodies an access-rule rejection produces, across services. Matched case-
+# insensitively against the raw text, which is the only place these words are
+# allowed to appear.
+_ACCESS_RULE_MARKERS = (
+    "access denied",
+    "firewall",
+    "virtual network",
+    "not allowed to access",
+    "public network access",
+    "forbidden by",
+)
+
+
+class AzureEndpointError(RuntimeError):
+    """A permanent failure talking to an Azure endpoint.
+
+    Subclasses `RuntimeError` deliberately: every existing handler catches that,
+    so adding this type changed no control flow anywhere.  Read `category` to
+    branch on the kind of failure; read `azure_message` for the service's own
+    words, which are never interpolated into `str(self)`.
+    """
+
+    def __init__(
+        self,
+        service: str,
+        *,
+        category: str,
+        hint: str,
+        status: int | None = None,
+        azure_message: str = "",
+        endpoint: str = "",
+        attempts: int = 0,
+    ) -> None:
+        self.service = service
+        self.category = category
+        self.hint = hint
+        self.status = status
+        self.azure_message = azure_message
+        self.endpoint = endpoint
+        self.attempts = attempts
+        super().__init__(f"{headline(service, category, status, attempts)}: {hint}")
+
+    def log_fields(self) -> dict[str, Any]:
+        """The structured fields every caller logs, so they all log the same set."""
+        return {
+            "category": self.category,
+            "status": self.status,
+            "hint": self.hint,
+            # The service's own text, quarantined to one field.
+            "azure_message": self.azure_message,
+        }
+
+
+def headline(service: str, category: str, status: int | None,
+             attempts: int = 0) -> str:
+    """One line naming what happened, in our vocabulary rather than Azure's."""
+    if category == "unreachable":
+        return f"{service} endpoint unreachable"
+    if category == "unavailable":
+        suffix = f" after {attempts} attempts" if attempts else ""
+        return f"{service} endpoint unavailable{suffix} (HTTP {status})"
+    if category == "not_found":
+        return f"{service} endpoint or deployment not found (HTTP {status})"
+    return f"{service} endpoint not accessible (HTTP {status})"
+
+
+def classify(status: int, body: str) -> tuple[str, str]:
+    """Map an HTTP status and body to (category, hint).
+
+    Pure, so `scripts/verify_azure_errors.py` can check the wording without a
+    network or an Azure subscription.
+    """
+    lowered = body.lower()
+
+    if status == 403:
+        if any(marker in lowered for marker in _ACCESS_RULE_MARKERS):
+            return "not_accessible", (
+                "the service refused this caller's network location, not its "
+                "credential. Check the resource's public network access and "
+                "access-rule settings, and whether this deployment's outbound "
+                "address is permitted -- a Container Apps environment with no "
+                "dedicated subnet egresses from a shared address that cannot be "
+                "allow-listed. Granting an RBAC role does not change this."
+            )
+        return "not_accessible", (
+            "the credential was accepted but is not authorised for this "
+            "deployment or index"
+        )
+
+    if status == 401:
+        return "not_accessible", (
+            "the credential was rejected -- wrong, rotated, or a secretref that "
+            "resolved to an empty string, which looks identical to a working one "
+            "in the portal"
+        )
+
+    if status == 404:
+        return "not_found", (
+            "no such deployment or index at this endpoint and api-version"
+        )
+
+    return "unavailable", f"the service returned {status}"
 
 # Pool bounds, overridable with AZURE_HTTP_MAX_CONNECTIONS.
 #
@@ -131,12 +260,14 @@ async def post_with_retry(
     to every other in-flight request instead of parking a thread on it.
     """
     last_error = ""
+    last_status: int | None = None
 
     for attempt in range(max_attempts):
         try:
             response = await client.post(url, json=payload, headers=headers)
         except httpx.HTTPError as exc:
             last_error = f"{type(exc).__name__}: {exc}"
+            last_status = None
             if attempt == max_attempts - 1:
                 break
             await asyncio.sleep(min(2 ** attempt, 8))
@@ -150,16 +281,32 @@ async def post_with_retry(
             log.warning(f"{what} throttled", status=response.status_code,
                         retry_in=delay, attempt=attempt + 1)
             if attempt == max_attempts - 1:
-                last_error = f"{response.status_code} after {max_attempts} attempts"
+                last_error = response.text[:BODY_BUDGET]
+                last_status = response.status_code
                 break
             await asyncio.sleep(delay)
             continue
 
-        raise RuntimeError(
-            f"{what} failed with {response.status_code}: {response.text[:300]}"
+        body = response.text[:BODY_BUDGET]
+        category, hint = classify(response.status_code, body)
+        raise AzureEndpointError(
+            what, category=category, hint=hint,
+            status=response.status_code, azure_message=body, endpoint=url,
         )
 
-    raise RuntimeError(f"{what} unreachable: {last_error}")
+    if last_status is None:
+        # No HTTP response at all. The transport error is the diagnosis here, so
+        # it *is* the hint -- there is no service message to quarantine.
+        raise AzureEndpointError(
+            what, category="unreachable", hint=last_error,
+            endpoint=url, attempts=max_attempts,
+        )
+
+    category, hint = classify(last_status, last_error)
+    raise AzureEndpointError(
+        what, category="unavailable", hint=hint, status=last_status,
+        azure_message=last_error, endpoint=url, attempts=max_attempts,
+    )
 
 
 async def aclose(*clients: httpx.AsyncClient | None) -> None:

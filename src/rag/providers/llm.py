@@ -19,7 +19,7 @@ from typing import Any
 from rag.config import Settings
 from rag.observability.tracing import get_logger, record_usage
 from rag.providers.http import aclose as http_aclose
-from rag.providers.http import make_client, post_with_retry
+from rag.providers.http import AzureEndpointError, make_client, post_with_retry
 
 log = get_logger(__name__)
 
@@ -158,11 +158,25 @@ class ChatProvider:
                 self._client, self._url(deployment), payload, headers,
                 what="Azure OpenAI chat completion",
             )
+        except AzureEndpointError as exc:
+            # A permanent misconfiguration is not a transient blip. Logging both
+            # at WARNING is why a standing 403 could degrade every LLM stage to
+            # its heuristic fallback -- silently, for as long as it lasted.
+            emit = (log.error
+                    if exc.category in ("not_accessible", "not_found")
+                    else log.warning)
+            emit(
+                "chat completion unavailable, caller will use its fallback",
+                deployment=deployment,
+                error=str(exc)[:800],
+                **exc.log_fields(),
+            )
+            return None
         except RuntimeError as exc:
             log.warning(
                 "chat completion unavailable, caller will use its fallback",
                 deployment=deployment,
-                error=str(exc)[:200],
+                error=str(exc)[:800],
             )
             return None
 

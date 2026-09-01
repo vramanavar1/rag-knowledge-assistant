@@ -345,6 +345,15 @@ class AssistantService:
         # instance must not take traffic, and it is what the operator needs to
         # read first.
         ready = stats.chunks > 0 and not self.startup_errors
+
+        # Tri-state, read back off the decision trace rather than kept as new
+        # state: True probed and answered, False probed and refused, None never
+        # attempted. Collapsing the last two into `false` would report a local
+        # run as broken.
+        trace = getattr(self.embedder, "decision_trace", [])
+        probe = next((s for s in trace if s.get("name") == "probe"), None)
+        reachable = None if probe is None else probe.get("result") == "ok"
+
         report: dict[str, Any] = {
             "status": "ready" if ready else "degraded",
             "profile": self.settings.profile,
@@ -366,6 +375,13 @@ class AssistantService:
                 "azure_openai_enabled": self.settings.aoai_enabled,
                 "azure_openai_credentials_present":
                     self.settings.azure_openai_credentials_present,
+                # Did the embedding deployment actually answer at boot? Without
+                # this, a refused endpoint under RETRIEVER_BACKEND=local shows up
+                # as nothing but `embeddings: local-hashing` -- indistinguishable
+                # from a deliberate offline run.
+                "azure_openai_reachable": reachable,
+                "embeddings_fallback_reason":
+                    getattr(self.embedder, "fallback_reason", "") or None,
             },
             "cache": {"hits": self.cache.hits, "misses": self.cache.misses},
             "detail": (
@@ -375,12 +391,16 @@ class AssistantService:
             ),
         }
 
-        if self.startup_errors:
-            report["startup_errors"] = self.startup_errors
-            # The decision trace is *why* the contract failed, so it ships with
-            # the failure rather than waiting behind a flag and a redeploy. It
-            # carries no secret -- see `_redact` in providers/embeddings.py.
-            trace = getattr(self.embedder, "decision_trace", [])
+        # A refused endpoint ships its trace too, not just a contract violation.
+        # The violation only fires under RETRIEVER_BACKEND=azure against an index
+        # of a different width -- so on every other configuration the reason the
+        # embedder fell back used to be reachable only by setting a flag and
+        # redeploying, which is the one thing you cannot do to a live symptom.
+        if self.startup_errors or reachable is False:
+            if self.startup_errors:
+                report["startup_errors"] = self.startup_errors
+            # The trace carries no secret -- see `_redact` in
+            # providers/embeddings.py.
             if trace:
                 report["embedding_decision"] = trace
 
